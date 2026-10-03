@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]  # PEP 639 `license = "MIT"`
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monitorctl"
+version = "0.2.0"
+description = "Controle DDC/CI de monitores com politica de seguranca explicita"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+classifiers = [
+  "Environment :: Console",
+  "Environment :: Win32 (MS Windows)",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+# No runtime dependencies on purpose: the whole thing runs on the standard
+# library, so there is no supply chain to audit for something that talks
+# directly to hardware.
+dependencies = []
+
+[project.scripts]
+monitorctl = "monitorctl.cli:main"
+
+[project.gui-scripts]
+monitorctl-app = "monitorctl.app.main:main"
+
+[tool.setuptools]
+packages = ["monitorctl", "monitorctl.app", "monitorctl.ddc", "monitorctl.gpu"]
+
+[tool.setuptools.package-data]
+"monitorctl.app" = ["assets/*.ico"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF"]
+ignore = [
+  # Win32 structure and function names must match the SDK spelling.
+  "N802",
+  "N803",
+  "N806",
+  "N815",
+  # Exception names read better as conditions than as nouns with an Error
+  # suffix: `raise PolicyViolation` and `raise RateLimited` say what happened.
+  "N818",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Win32 structure names must match the SDK spelling.
+"monitorctl/ddc/windows.py" = ["N801"]
+"monitorctl/app/win32.py" = ["N801"]
+# User-facing copy reads better unbroken, and uses real typography (en dashes).
+"monitorctl/app/window.py" = ["E501"]
+"monitorctl/app/calibration.py" = ["E501", "RUF001"]
+"tests/*" = ["E501"]
