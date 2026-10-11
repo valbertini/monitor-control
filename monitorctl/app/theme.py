@@ -71,6 +71,48 @@ PALETTES: dict[Theme, Palette] = {
 }
 
 
+#: Styles whose ``clam`` layout has a dotted focus ring; derived styles
+#: (``Accent.TButton``, ...) take their parent's layout.
+FOCUS_RING_STYLES = (
+    "TButton",
+    "TCheckbutton",
+    "TRadiobutton",
+    "TMenubutton",
+    "TNotebook.Tab",
+)
+
+Layout = list[tuple[str, dict]]
+
+
+def without_focus_ring(layout: Layout) -> Layout:
+    """``layout`` with every ``*.focus`` element replaced by what it holds.
+
+    The ring is an element wrapping the label, so nothing moves when what it
+    wraps takes its place: a lone child, which only filled the ring, takes
+    the ring's side and sticky; several children keep their own, which
+    placed them inside it.  Idempotent: a theme switch re-applies it to a
+    layout that no longer has a ring.
+    """
+    result: Layout = []
+    for name, options in layout:
+        children = without_focus_ring(options.get("children", []))
+        if name.endswith(".focus"):
+            place = {k: v for k, v in options.items() if k in ("side", "sticky")}
+            for child, child_options in children:
+                merged = (
+                    {**child_options, **place}
+                    if len(children) == 1
+                    else {**place, **child_options}
+                )
+                result.append((child, merged))
+            continue
+        options = dict(options)
+        if children:
+            options["children"] = children
+        result.append((name, options))
+    return result
+
+
 def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
     """Configure every style the window uses; returns the palette applied."""
     p = PALETTES[theme]
@@ -115,6 +157,7 @@ def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
     style.configure("Drifted.TLabel", foreground=p.warn)
     style.configure("CardError.TLabel", background=p.surface, foreground=p.error)
     style.configure("Dim.TLabel", foreground=p.text_dim)
+    style.configure("Goal.TLabel", font=("Segoe UI Semibold", 11))
     style.configure("Faint.TLabel", foreground=p.text_faint)
     style.configure("Feature.TLabel", background=p.surface)
     style.configure("ReadOnly.TLabel", background=p.surface, foreground=p.text_faint)
@@ -250,6 +293,7 @@ def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
         ],
         foreground=[("disabled", p.text_faint)],
         arrowcolor=[("disabled", p.text_faint)],
+        bordercolor=[("focus", p.accent)],
     )
     style.configure(
         "Accent.TButton",
@@ -266,32 +310,12 @@ def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
     )
 
     style.configure("TNotebook", background=p.bg, borderwidth=0, tabmargins=(8, 6, 8, 0))
-    # clam's tab draws a dotted focus ring around its label whenever the tab
-    # strip has focus - which a click on a tab gives it.  The selected tab is
-    # already marked by its colour; the ring only looked like a glitch.
-    style.layout(
-        "TNotebook.Tab",
-        [
-            (
-                "Notebook.tab",
-                {
-                    "sticky": "nswe",
-                    "children": [
-                        (
-                            "Notebook.padding",
-                            {
-                                "side": "top",
-                                "sticky": "nswe",
-                                "children": [
-                                    ("Notebook.label", {"side": "top", "sticky": ""})
-                                ],
-                            },
-                        )
-                    ],
-                },
-            )
-        ],
-    )
+    # clam draws a dotted ring around the label of whatever has focus - and a
+    # click gives focus to a tab, a button or a check box, so the ring showed up
+    # after every click and looked like a glitch.  Focus shows instead in the
+    # accent colour: a button's border, a tab's or a check box's text.
+    for name in FOCUS_RING_STYLES:
+        style.layout(name, without_focus_ring(style.layout(name)))
     style.configure(
         "TNotebook.Tab",
         background=p.bg,
@@ -304,7 +328,7 @@ def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
     style.map(
         "TNotebook.Tab",
         background=[("selected", p.surface)],
-        # The focus ring is gone (layout below); a tab focused from the keyboard
+        # The focus ring is gone (above); a tab focused from the keyboard
         # shows in the accent colour instead.
         foreground=[
             ("focus", "selected", p.accent),
@@ -322,7 +346,7 @@ def apply_theme(root: tk.Tk, theme: Theme) -> Palette:
             name,
             indicatorcolor=[("selected", p.accent), ("pressed", p.surface_3)],
             background=[("active", p.surface)],
-            foreground=[("disabled", p.text_faint)],
+            foreground=[("disabled", p.text_faint), ("focus", p.accent)],
         )
 
     _thin_scale(root, style, p, theme)

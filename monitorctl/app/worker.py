@@ -118,6 +118,8 @@ class Worker:
         self._done: queue.Queue[_Done] = queue.Queue()
         self._lock = threading.Lock()
         self._pending = _Pending()
+        #: The keeper may have just been freed (see :meth:`nudge`).
+        self._nudged = False
         self._next_check = clock() + settings().interval_seconds
         self._stopping = False
         self._thread = threading.Thread(
@@ -163,9 +165,20 @@ class Worker:
         self._jobs.put(None)  # wake the loop so it recomputes its deadline
 
     def reschedule(self) -> None:
-        """Settings changed: restart the countdown to the next check."""
+        """Settings changed: restart the countdown to the next check.
+
+        Also a :meth:`nudge`: the change may be the end of a pause.
+        """
         with self._lock:
             self._next_check = self._clock() + self._settings().interval_seconds
+            self._nudged = True
+        self._jobs.put(None)
+
+    def nudge(self) -> None:
+        """The keeper may be free again (a pause or an edit ended): pay what
+        it owes now rather than at the next check, minutes away."""
+        with self._lock:
+            self._nudged = True
         self._jobs.put(None)
 
     def drain(self) -> None:
@@ -214,11 +227,14 @@ class Worker:
             check = now >= self._next_check
             if check:
                 self._next_check = now + self._settings().interval_seconds
+            nudged, self._nudged = self._nudged, False
         if events:
             event = next(e for e in _EVENT_PRIORITY if e in events)
             self._keep(lambda: self._keeper.handle_event(event), f"event: {event.value}")
         elif check:
             self._keep(self._keeper.tick, "periodic check")
+        elif nudged:
+            self._keep(self._keeper.catch_up, "catching up")
 
     def _keep(self, action: Callable[[], KeeperResult | None], label: str) -> None:
         try:

@@ -13,7 +13,14 @@ import os
 import tempfile
 from pathlib import Path
 
-__all__ = ["atomic_write_text", "state_directory"]
+__all__ = ["UNREADABLE", "atomic_write_text", "decode_state", "state_directory"]
+
+#: What reading a damaged state file can raise past ``json.loads`` and the
+#: payload parsers: bad bytes and bad JSON (``ValueError``), a value of the
+#: wrong type, a number too large for a float, nesting too deep to parse.
+#: Each means "unreadable", never "crash": the settings are read when the
+#: app starts, so an escaping error would stop it from starting at all.
+UNREADABLE = (ValueError, TypeError, OverflowError, RecursionError)
 
 
 def state_directory() -> Path:
@@ -30,6 +37,18 @@ def state_directory() -> Path:
     xdg_state = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
     return base / "monitorctl"
+
+
+def decode_state(raw: bytes) -> str:
+    """The text of a state file, as written by this program or edited by hand.
+
+    ``utf-8-sig`` also accepts a byte-order mark, which Notepad and Windows
+    PowerShell 5.1 put in front of UTF-8 and plain ``json.loads`` rejects.
+
+    Raises:
+        UnicodeDecodeError: Not UTF-8 - one of :data:`UNREADABLE`.
+    """
+    return raw.decode("utf-8-sig")
 
 
 def atomic_write_text(target: Path, text: str) -> None:

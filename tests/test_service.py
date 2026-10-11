@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import unittest
 
+from monitorctl.ddc.edid import EdidInfo
 from monitorctl.ddc.errors import (
     DdcBackendError,
     DdcTransientError,
@@ -15,7 +16,8 @@ from monitorctl.ddc.errors import (
     RateLimited,
 )
 from monitorctl.ddc.policy import WriteBudget
-from monitorctl.ddc.service import MonitorService, Pacing
+from monitorctl.ddc.profiles import ProfileStore
+from monitorctl.ddc.service import MonitorService, Pacing, Reassert
 from monitorctl.ddc.vcp import FEATURES
 from monitorctl.gpu import GpuController
 
@@ -394,6 +396,81 @@ class TestLifecycle(unittest.TestCase):
         service.close()
         with self.assertRaises(DdcBackendError):
             service.list_monitors()
+
+
+TCL = EdidInfo("TCL", 0x1003, 0xFFFFFFFF, "2E675AA021124", "25G64")
+ASUS = EdidInfo("ACI", 0x2498, 0, "SERIAL-B", "VS248")
+
+
+class TestResolve(unittest.TestCase):
+    """A job queued behind a re-enumeration finds its monitor by EDID."""
+
+    def setUp(self) -> None:
+        self.tcl = make_monitor(device=r"\\.\DISPLAY1", edid=TCL)
+        self.asus = make_monitor(device=r"\\.\DISPLAY2", edid=ASUS)
+        self.monitors = [self.tcl, self.asus]
+        self.service = make_service(self.monitors)
+        self.addCleanup(self.service.close)
+        self.tcl_id = self.service.list_monitors(probe=False)[0].id
+
+    def test_it_follows_the_panel_when_windows_renumbers(self) -> None:
+        self.tcl.device, self.asus.device = self.asus.device, self.tcl.device
+        self.service.refresh(probe=False)
+        now = self.service.resolve(TCL.hardware_id, self.tcl_id)
+        self.assertNotEqual(now, self.tcl_id)
+        self.assertEqual(self.service.get_monitor(now).hardware_id, TCL.hardware_id)
+
+    def test_a_monitor_gone_is_never_taken_for_the_one_in_its_place(self) -> None:
+        self.monitors.remove(self.tcl)
+        self.asus.device = r"\\.\DISPLAY1"
+        self.service.refresh(probe=False)
+        with self.assertRaises(MonitorNotFound):
+            self.service.resolve(TCL.hardware_id, self.tcl_id)
+
+    def test_without_an_identity_the_position_is_all_there_is(self) -> None:
+        self.tcl.edid = None
+        monitor_id = self.service.refresh(probe=False)[0].id
+        self.assertEqual(self.service.resolve("", monitor_id), monitor_id)
+
+    def test_identical_panels_fall_back_to_the_position(self) -> None:
+        self.asus.edid = TCL
+        second = self.service.refresh(probe=False)[1].id
+        self.assertEqual(self.service.resolve(TCL.hardware_id, second), second)
+
+
+class TestReassertCurrent(unittest.TestCase):
+    """Apply with nothing waiting: the values shown, to what a monitor forgets."""
+
+    def test_forgetful_controls_get_their_current_value_through_the_pivot(self) -> None:
+        tcl = FakeMonitor(
+            capabilities="(prot(monitor)type(LCD)model(X)vcp(10 16)mccs_ver(2.1))",
+            values={0x10: 40, 0x16: 62},
+            maxima={0x10: 100, 0x16: 100},
+            edid=TCL,
+            ignores_same_value=frozenset({0x16}),
+        )
+        with make_service([tcl]) as service:
+            service.list_monitors()
+            tcl.writes.clear()
+            report = service.reassert_current(reassert=Reassert.PIVOT)
+        # Brightness is kept by the monitor: its read-back is the truth.
+        self.assertEqual(tcl.writes, [(0x16, 50), (0x16, 62)])
+        self.assertEqual([o.key for o in report.applied], ["red_gain"])
+
+    def test_a_monitor_that_keeps_its_settings_is_not_written(self) -> None:
+        monitor = make_monitor(edid=ASUS)
+        with make_service([monitor]) as service:
+            service.list_monitors()
+            monitor.writes.clear()
+            report = service.reassert_current(reassert=Reassert.PIVOT)
+        self.assertEqual(monitor.writes, [])
+        self.assertEqual(report.applied, ())
+
+    def test_it_needs_no_saved_profile(self) -> None:
+        monitor = make_monitor()
+        with make_service([monitor], profiles=ProfileStore()) as service:
+            service.list_monitors()
+            service.reassert_current(reassert=Reassert.PIVOT)  # no SnapshotMissing
 
 
 if __name__ == "__main__":

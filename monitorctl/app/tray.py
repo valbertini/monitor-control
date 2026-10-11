@@ -12,14 +12,19 @@ One message loop, two owners
     the process.  That works because Tk's Windows notifier dispatches *every*
     message of the thread, including the hidden window's: the tray keeps
     answering while Tk owns the loop, and nothing ever runs Tk off the main
-    thread.  The window is hidden, not destroyed, when closed; re-creating a Tk
-    interpreter costs more than keeping the idle one.
+    thread.  The hidden window's handlers must still never call Tk
+    themselves while Tk owns the loop - that aborts the interpreter (see
+    ``handoff.py``) - so whatever of theirs may touch the window goes through
+    :class:`~monitorctl.app.handoff.TkHandoff`.  The window is hidden, not
+    destroyed, when closed; re-creating a Tk interpreter costs more than
+    keeping the idle one.
 
 Getting results back
     The bus thread never calls the UI.  It queues a result and posts
     ``WM_APP_WORKER`` to the hidden window, and the main thread drains the
-    queue.  ``PostMessageW`` is thread-safe and never blocks, so a slow window
-    cannot stall the bus and vice versa.
+    queue - at once in the plain loop, from a Tk timer once Tk owns it.
+    ``PostMessageW`` is thread-safe and never blocks, so a slow window cannot
+    stall the bus and vice versa.
 """
 
 from __future__ import annotations
@@ -37,8 +42,9 @@ from ..ddc.service import MonitorService
 from ..ddc.snapshot import legacy_snapshot_path
 from ..gpu import GpuController
 from . import win32
+from .handoff import TkHandoff
 from .keeper import Event, Keeper, KeeperResult
-from .settings import RefreshMode, SettingsStore, default_settings_path
+from .settings import AppSettings, RefreshMode, SettingsStore, default_settings_path
 from .worker import Worker
 
 if TYPE_CHECKING:
@@ -101,6 +107,8 @@ class TrayApp:
         self._last_action = ""
         #: Last console display state Windows reported: 0 off, 1 on, 2 dimmed.
         self._display_state: int | None = None
+        #: Where the hidden window's handlers send anything that may touch Tk.
+        self._handoff = TkHandoff()
 
         self.keeper = Keeper(
             self.service, self.settings.get, suspended=lambda: self._editing
@@ -157,14 +165,14 @@ class TrayApp:
         w = self.window
         w.on(WM_APP_TRAY, self._on_tray)
         w.on(WM_APP_WORKER, lambda _wp, _lp: self._drain())
-        w.on(WM_APP_SHOW, lambda _wp, _lp: self.open_window() or 0)
+        w.on(WM_APP_SHOW, lambda _wp, _lp: self._handoff.run(self.open_window) or 0)
         w.on(w.register_message("TaskbarCreated"), self._on_taskbar_created)
         w.on(win32.WM_DISPLAYCHANGE, lambda _wp, _lp: self._event(Event.DISPLAY_CHANGED))
         w.on(win32.WM_DEVICECHANGE, self._on_device_change)
         w.on(win32.WM_POWERBROADCAST, self._on_power)
         w.on(win32.WM_WTSSESSION_CHANGE, self._on_session)
         w.on(win32.WM_QUERYENDSESSION, lambda _wp, _lp: 1)
-        w.on(win32.WM_CLOSE, lambda _wp, _lp: self.exit() or 0)
+        w.on(win32.WM_CLOSE, lambda _wp, _lp: self._handoff.run(self.exit) or 0)
         w.on(win32.WM_ENDSESSION, self._on_end_session)
         w.watch_monitors()
         w.watch_display_power()
@@ -176,10 +184,18 @@ class TrayApp:
         from .window import MainWindow
 
         root = tk.Tk()
-        root.withdraw()
-        self._ui = MainWindow(root, self, str(ICON_PATH) if ICON_PATH.is_file() else None)
-        self._ui.show()
-        root.mainloop()
+        # Before anything can pump a message: from here on the hidden window's
+        # handlers must not call Tk themselves.
+        self._handoff.attach(root)
+        try:
+            root.withdraw()
+            self._ui = MainWindow(
+                root, self, str(ICON_PATH) if ICON_PATH.is_file() else None
+            )
+            self._ui.show()
+            root.mainloop()
+        finally:
+            self._handoff.detach()
         self._exiting = True
 
     def open_window(self) -> None:
@@ -216,7 +232,10 @@ class TrayApp:
         self._update_tooltip()
 
     def set_editing(self, editing: bool) -> None:
-        self._editing = editing
+        was, self._editing = self._editing, editing
+        if was and not editing:
+            # Whatever the keeper had to let pass meanwhile is paid now.
+            self.worker.nudge()
 
     def window_hidden(self) -> None:
         # The window's pages are not needed until it is opened again.
@@ -274,7 +293,7 @@ class TrayApp:
         return 0
 
     def _drain(self) -> int:
-        self.worker.drain()
+        self._handoff.run(self.worker.drain)
         return 0
 
     # ------------------------------------------------------------------ #
@@ -284,7 +303,7 @@ class TrayApp:
     def _on_tray(self, wparam: int, lparam: int) -> int:
         event = win32.loword(lparam)
         if event in (win32.NIN_SELECT, win32.NIN_KEYSELECT, win32.WM_LBUTTONDBLCLK):
-            self.open_window()
+            self._handoff.run(self.open_window)
         elif event == win32.WM_CONTEXTMENU:
             x, y = win32.signed_xy(wparam)
             self._menu(x, y)
@@ -312,7 +331,12 @@ class TrayApp:
             win32.SEPARATOR,
             win32.MenuItem("Exit", Command.EXIT),
         ]
+        # The menu itself needs no Tk; what the chosen command does may.
         command = self.tray.popup(items, x, y)
+        if command:
+            self._handoff.run(lambda: self._command(command, settings, autostart_on))
+
+    def _command(self, command: int, settings: AppSettings, autostart_on: bool) -> None:
         if command == Command.OPEN:
             self.open_window()
         elif command == Command.RESTORE:
@@ -326,15 +350,17 @@ class TrayApp:
                 self._ui.paused_var.set(not settings.paused)
                 self._ui.refresh_keeper_label()
         elif command == Command.AUTOSTART:
+            now_on = autostart_on  # unchanged unless the registry agreed
             try:
                 if autostart_on:
                     autostart.disable()
                 else:
                     autostart.enable()
+                now_on = not autostart_on
             except autostart.AutostartError as exc:
                 _log.warning("%s", exc)
             if self._ui is not None:
-                self._ui.autostart_var.set(not autostart_on)
+                self._ui.autostart_var.set(now_on)
         elif command == Command.EXIT:
             # Only the menu asks about unsaved changes; WM_CLOSE (``--quit``,
             # the build script, logoff) must never wait for a person.

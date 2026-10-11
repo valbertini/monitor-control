@@ -24,13 +24,16 @@ from types import MappingProxyType
 
 __all__ = [
     "CATEGORIES",
+    "DIGITAL_INPUTS",
     "FEATURES",
     "FEATURES_BY_CODE",
+    "GEOMETRY_KEYS",
     "CategoryInfo",
     "FeatureCategory",
     "FeatureKind",
     "VcpFeature",
     "feature_by_code",
+    "inert_keys",
 ]
 
 
@@ -734,3 +737,30 @@ if len(FEATURES) != len(_ALL) or len(FEATURES_BY_CODE) != len(_ALL):
 def feature_by_code(code: int) -> VcpFeature | None:
     """Look up a feature by its VCP code, or ``None`` if not in the registry."""
     return FEATURES_BY_CODE.get(code)
+
+
+#: Input sources (``input_source``, VCP 0x60) that carry a digital signal: DVI,
+#: DisplayPort, HDMI.  DVI-I can carry analogue too, but a monitor reporting
+#: one would be the first seen; the ASUS VS248 calls its HDMI port "DVI 2".
+DIGITAL_INPUTS: frozenset[int] = frozenset({0x03, 0x04, 0x0F, 0x10, 0x11, 0x12})
+
+#: The analogue-only controls: they act on the sampling of a VGA-style signal.
+GEOMETRY_KEYS: frozenset[str] = frozenset(
+    f.key for f in _ALL if f.category is FeatureCategory.GEOMETRY
+)
+
+
+def inert_keys(input_source: int | None) -> frozenset[str]:
+    """The controls that do nothing on the input a monitor is showing.
+
+    On a digital input the geometry controls are inert, and the firmware may
+    answer with anything: the ASUS VS248 on HDMI reads ``horizontal_position``
+    above its own maximum, and the value moves by itself (181, later 189).
+    Saving, restoring or comparing such a value is comparing noise - it showed
+    up as "unsaved changes" no one made, and a Restore wrote 181 into a control
+    the survey says not to write outside VGA (D32).
+
+    An unknown input (not read, or a code outside MCCS) leaves everything in
+    effect: only a certainly-digital input turns anything off.
+    """
+    return GEOMETRY_KEYS if input_source in DIGITAL_INPUTS else frozenset()

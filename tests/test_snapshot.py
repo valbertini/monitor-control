@@ -188,6 +188,20 @@ class TestSave(unittest.TestCase):
             self.assertEqual(monitor.writes, [])
             self.assertEqual(service.write_budget_available, budget_before)
 
+    def test_keys_kept_from_the_saved_profile_are_not_replaced(self) -> None:
+        """The CLI cannot see the tray app's software LUT: it would save it as
+        neutral, erasing the user's adjustment from the profile."""
+        monitor = make_monitor()
+        store = ProfileStore()
+        with make_service([monitor], store=store) as service:
+            service.save_snapshot()
+            monitor.values[0x10] = 80
+            monitor.values[0x12] = 10
+            service.refresh()
+            service.save_snapshot(keep_saved={"contrast"})
+        values = store.load().monitors[0].values
+        self.assertEqual((values["brightness"], values["contrast"]), (80, 70))
+
     def test_identity_is_recorded_for_later_matching(self) -> None:
         with make_service([make_monitor()]) as service:
             saved = service.save_snapshot().monitors[0]
@@ -412,6 +426,62 @@ class TestRestore(unittest.TestCase):
         with make_service([make_monitor()]) as service:
             snapshot = service.save_snapshot()
             self.assertEqual(service.restore_snapshot().saved_at, snapshot.saved_at)
+
+
+class TestAnalogueOnlyControls(unittest.TestCase):
+    """Geometry on a digital input reads noise: never saved or written (D32).
+
+    The ASUS VS248 on HDMI ("DVI 2") read horizontal position 181, later 189,
+    above its own maximum of 100, with nobody touching it.
+    """
+
+    VGA, HDMI = 0x01, 0x04
+
+    def monitor(self, source: int | None) -> FakeMonitor:
+        values = {**VALUES, 0x20: 181}
+        maxima = {**MAXIMA, 0x20: 255}
+        if source is not None:
+            values[0x60], maxima[0x60] = source, 0x12
+        caps = CAPS.replace("60(0F 11)", "60(01 04) 20")
+        return make_monitor(capabilities=caps, values=values, maxima=maxima)
+
+    def test_save_on_a_digital_input_leaves_geometry_out(self) -> None:
+        with make_service([self.monitor(self.HDMI)]) as service:
+            saved = service.save_snapshot().monitors[0].values
+            self.assertNotIn("horizontal_position", saved)
+            self.assertEqual(saved["input_source"], self.HDMI)
+
+    def test_save_on_an_analogue_input_keeps_it(self) -> None:
+        with make_service([self.monitor(self.VGA)]) as service:
+            saved = service.save_snapshot().monitors[0].values
+            self.assertEqual(saved["horizontal_position"], 181)
+
+    def test_an_unknown_input_changes_nothing(self) -> None:
+        with make_service([self.monitor(None)]) as service:
+            saved = service.save_snapshot().monitors[0].values
+            self.assertEqual(saved["horizontal_position"], 181)
+
+    def test_restore_on_a_digital_input_does_not_write_geometry(self) -> None:
+        """Decided on a fresh read: the input was changed on the monitor."""
+        monitor = self.monitor(self.VGA)
+        with make_service([monitor]) as service:
+            service.save_snapshot()
+            monitor.values[0x60] = self.HDMI  # OSD buttons; the cache says VGA
+            monitor.values[0x20] = 189
+            monitor.writes.clear()
+            report = service.restore_snapshot()
+            self.assertNotIn(0x20, [code for code, _ in monitor.writes])
+            self.assertEqual(report.skipped, ())
+            self.assertEqual(report.failed, ())
+
+    def test_restore_on_an_analogue_input_puts_geometry_back(self) -> None:
+        monitor = self.monitor(self.VGA)
+        with make_service([monitor]) as service:
+            service.save_snapshot()
+            monitor.values[0x20] = 120
+            monitor.writes.clear()
+            service.restore_snapshot()
+            self.assertEqual(monitor.writes, [(0x20, 181)])
 
 
 class TestSavedSnapshotQuery(unittest.TestCase):
@@ -763,6 +833,27 @@ class TestAfterACheapEnumeration(unittest.TestCase):
         self.assertTrue(state.probed)
         self.assertEqual(state.feature("brightness").value, 50)
         self.assertEqual(monitor.reads, [])
+
+    def test_a_control_whose_probe_read_failed_is_tried_again(self) -> None:
+        """A probe during power-up must not drop a control from Restore and
+        upkeep for the session: every cheap enumeration carries it over."""
+        tcl = make_monitor(edid=TCL, ignores_same_value=frozenset({0x16}))
+        store = ProfileStore()
+        with make_service([tcl], store=store) as service:
+            service.save_snapshot()
+        tcl.transient_failures = {0x10: 2, 0x16: 2}  # retry exhausted
+        with make_service([tcl], store=store) as service:
+            service.list_monitors()
+            service.refresh(probe=False)
+            tcl.writes.clear()
+            upkeep = service.reassert_saved(reassert=Reassert.PIVOT)
+            self.assertEqual(tcl.writes, [(0x16, 50), (0x16, 60)])
+            self.assertEqual(upkeep.skipped, ())
+            tcl.values[0x10] = 99
+            restore = service.restore_snapshot()
+        self.assertEqual(tcl.values[0x10], 50)
+        self.assertIn("brightness", [o.key for o in restore.applied])
+        self.assertEqual(restore.skipped, ())
 
     def test_a_monitor_without_an_edid_is_never_assumed_the_same(self) -> None:
         monitor = make_monitor()

@@ -16,8 +16,12 @@ from monitorctl import autostart, cli
 
 
 class DictRunKey:
-    def __init__(self, values: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, values: dict[str, str] | None = None, *, off: set[str] | None = None
+    ) -> None:
         self.values = dict(values or {})
+        #: Names switched off in Task Manager's Startup apps.
+        self.off = set(off or ())
 
     def get(self, name: str) -> str | None:
         return self.values.get(name)
@@ -27,6 +31,12 @@ class DictRunKey:
 
     def delete(self, name: str) -> None:
         self.values.pop(name, None)
+
+    def switched_off(self, name: str) -> bool:
+        return name in self.off
+
+    def clear_switch(self, name: str) -> None:
+        self.off.discard(name)
 
 
 class TestLaunchCommand(unittest.TestCase):
@@ -104,6 +114,36 @@ class TestRunKey(unittest.TestCase):
         key = DictRunKey()
         self.assertFalse(autostart.repair(key))
         self.assertEqual(key.values, {})
+
+    def test_switched_off_in_task_manager_is_not_enabled(self) -> None:
+        """The Run value stays when Task Manager switches it off (2026-10-03)."""
+        key = DictRunKey(
+            {autostart.VALUE_NAME: autostart.launch_command()},
+            off={autostart.VALUE_NAME},
+        )
+        self.assertFalse(autostart.is_enabled(key))
+
+    def test_enable_switches_it_back_on(self) -> None:
+        """Otherwise enabling from the app rewrites a value Windows skips."""
+        key = DictRunKey({autostart.VALUE_NAME: "old"}, off={autostart.VALUE_NAME})
+        autostart.enable(key)
+        self.assertEqual(key.off, set())
+        self.assertTrue(autostart.is_enabled(key))
+
+    def test_disable_leaves_no_switch_behind(self) -> None:
+        key = DictRunKey({autostart.VALUE_NAME: "x"}, off={autostart.VALUE_NAME})
+        self.assertTrue(autostart.disable(key))
+        self.assertEqual((key.values, key.off), ({}, set()))
+
+    def test_repair_keeps_task_managers_switch(self) -> None:
+        """Repair follows a moved folder; it never overrides the user's switch."""
+        key = DictRunKey(
+            {autostart.VALUE_NAME: r'"D:\old place\monitorctl.exe" --startup'},
+            off={autostart.VALUE_NAME},
+        )
+        self.assertTrue(autostart.repair(key))
+        self.assertEqual(key.off, {autostart.VALUE_NAME})
+        self.assertFalse(autostart.is_enabled(key))
 
 
 class TestCli(unittest.TestCase):

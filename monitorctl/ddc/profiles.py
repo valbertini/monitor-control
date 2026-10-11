@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from ..fileio import atomic_write_text, state_directory
+from ..fileio import UNREADABLE, atomic_write_text, decode_state, state_directory
 from .errors import ProfileError, SnapshotError
 from .snapshot import (
     Identity,
@@ -634,10 +634,10 @@ class ProfileStore:
         self._unreadable = False
         if not exists:
             return self._from_legacy()
-        raw = self._path.read_text(encoding="utf-8")  # type: ignore[union-attr]
+        raw = self._path.read_bytes()  # type: ignore[union-attr]
         try:
-            return ProfileBook.from_payload(json.loads(raw))
-        except (ValueError, TypeError) as exc:
+            return ProfileBook.from_payload(json.loads(decode_state(raw)))
+        except UNREADABLE as exc:
             _log.warning("ignoring unreadable profiles %s: %s", self._path, exc)
             self._unreadable = True
             return ProfileBook()
@@ -646,14 +646,14 @@ class ProfileStore:
         if self._legacy is None:
             return ProfileBook()
         try:
-            raw = self._legacy.read_text(encoding="utf-8")
+            raw = self._legacy.read_bytes()
         except FileNotFoundError:
             return ProfileBook()
         # Any other OSError propagates, like the main file's: losing the
         # migration to a momentary lock would lose what was saved before.
         try:
-            snapshot = Snapshot.from_payload(json.loads(raw))
-        except (ValueError, TypeError) as exc:
+            snapshot = Snapshot.from_payload(json.loads(decode_state(raw)))
+        except UNREADABLE as exc:
             _log.warning("ignoring unreadable snapshot %s: %s", self._legacy, exc)
             return ProfileBook()
         _log.info(

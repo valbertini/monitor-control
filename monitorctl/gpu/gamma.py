@@ -38,7 +38,7 @@ from ..ddc.vcp import FeatureCategory
 from .base import GpuAdjustment, GpuBackend, GpuReading
 from .errors import GpuError
 
-__all__ = ["GammaRampBackend"]
+__all__ = ["SOFTWARE_LUT_KEYS", "GammaRampBackend"]
 
 _log = logging.getLogger(__name__)
 
@@ -48,6 +48,11 @@ _RampArray = ctypes.c_uint16 * _RAMP_ENTRIES * 3
 KEY_BRIGHTNESS = "gpu_sw_brightness"
 KEY_CONTRAST = "gpu_sw_contrast"
 KEY_GAMMA = "gpu_sw_gamma"
+
+#: The three controls.  Their values live in the process that set them and
+#: last only while it runs (``close``): a short-lived process such as the CLI
+#: neither sees the tray app's values nor can keep its own.
+SOFTWARE_LUT_KEYS = frozenset({KEY_BRIGHTNESS, KEY_CONTRAST, KEY_GAMMA})
 
 _SOURCE = "software LUT"
 
@@ -286,8 +291,20 @@ class GammaRampBackend(GpuBackend):
             if key not in (KEY_BRIGHTNESS, KEY_CONTRAST, KEY_GAMMA):
                 raise GpuError(f"unknown gamma adjustment {key!r}")
             # Confirm the device really has a ramp before claiming support.
-            self._read_ramp(device)
-            return GpuReading(current=self._values(device)[key], minimum=0, maximum=100)
+            ramp = self._read_ramp(device)
+            values = self._values(device)
+            if any(v != _NEUTRAL for v in values.values()) and not self._ours(
+                device, ramp
+            ):
+                # A driver reset, Night Light or a game replaced our ramp: the
+                # adjustment is no longer on screen, so it must not read as
+                # applied - a Restore comparing against it would call it
+                # "already correct" and leave the screen without it.
+                _log.info("the gamma ramp of %s is no longer ours", device)
+                values.update(dict.fromkeys(values, _NEUTRAL))
+                self._original.pop(device, None)
+                self._written.pop(device, None)
+            return GpuReading(current=values[key], minimum=0, maximum=100)
 
     def set(self, device: str, key: str, value: int) -> int:
         with self._lock:

@@ -388,6 +388,7 @@ Formato: **contexto → decisão → alternativas descartadas → consequências
   o Windows para algo que o próximo build apaga. Ativar remove a tarefa antiga.
 - **Atraso:** a chave Run não atrasa; o app espera 10 s antes da primeira
   aplicação quando iniciado com `--startup`.
+- O interruptor de *Aplicativos de inicialização* também conta: ver D32a.
 
 ### D16 — Pasta portátil com PyInstaller
 
@@ -619,6 +620,221 @@ Formato: **contexto → decisão → alternativas descartadas → consequências
 - **Consequências:** a calibração diz o controle de cada passo; o usuário ajusta
   na janela principal, lado a lado.
 
+### D30 — Handlers da janela oculta nunca chamam o Tk enquanto ele roda o loop
+
+- **Contexto:** o `.exe` caiu três vezes (02/10 18:44 e 19:03, 03/10 00:06) sem
+  nada no log. O Windows registrou `0xc0000409` em `ucrtbase.dll`, que é um
+  `abort()`. No minidump (`%LOCALAPPDATA%\CrashDumps`) estava a pilha
+  `Tcl → _tkinter → PyEval_RestoreThread → _Py_FatalErrorFunc` com a mensagem
+  "the GIL is released (the current Python thread state is NULL)". O usuário
+  arrastava o slider de brilho rapidamente até o máximo.
+- **Causa:** com a janela aberta, quem bombeia as mensagens é o `Tk.mainloop()`.
+  A `WM_APP_WORKER` chega ao WNDPROC da janela oculta, que é um callback do
+  ctypes, de dentro do `Tcl_DoOneEvent`, e esse handler chamava o Tk
+  (`worker.drain` → callbacks da janela).
+  - Toda chamada ao Tk termina zerando o *thread state* que o `_tkinter` guardou
+    ao entrar no Tcl.
+  - O próximo evento Tcl do mesmo `Tcl_DoOneEvent` que chama Python (um
+    `<B1-Motion>` do slider, um `after` do debounce) encontra esse estado nulo,
+    e o interpretador aborta.
+  - Reproduzido com `MessageWindow` + Tk + uma thread inundando mensagens: cai
+    em segundos.
+- **Decisão:** `app/handoff.py` (`TkHandoff`).
+  - Antes de o Tk existir, a ação roda na hora.
+  - Depois, entra numa fila que um timer do Tk executa, com o Python entrando
+    pelo caminho que o `_tkinter` espera: a cada 50 ms com a janela visível e a
+    cada 250 ms escondida.
+  - Passam pela fila: o drain do worker, abrir a janela (clique na bandeja e
+    segunda instância), `WM_CLOSE` e o comando escolhido no menu da bandeja. O
+    menu em si (`TrackPopupMenuEx`) continua no handler, porque não toca o Tk.
+  - O `faulthandler` grava em `crash.log` a pilha de qualquer abort futuro.
+- **Alternativas:**
+  - Chamar o Tk a partir da thread do barramento, que o `_tkinter` encaminha:
+    quebra o invariante "o barramento nunca chama a UI" e bloqueia a thread no
+    encerramento.
+  - Postar `WM_CLOSE` para uma Toplevel oculta e usar o protocolo
+    `WM_DELETE_WINDOW` como campainha: depende de detalhe interno do Tk e
+    confunde o fechar.
+  - Enfileirar um evento Tcl via ctypes no `tcl86t.dll`: frágil.
+  - O polling foi a opção mais simples de provar.
+- **Consequências:**
+  - Até 50 ms a mais para o resultado de uma escrita aparecer no slider.
+  - Quatro despertares por segundo com a janela escondida, um custo não
+    mensurável.
+  - O teste `test_handoff` reproduz o crash num processo filho, com e sem o
+    handoff.
+
+### D31 — Calibração: um objetivo concreto por passo e linhas "se X → mexa Y"
+
+- **Contexto:** o usuário achou as instruções longas e vagas ("deveria ser quase
+  imperceptível piscar no número X") e não viu diferença no passo de gama, que
+  tinha cinco quadrados candidatos.
+- **Decisão:** cada `Step` tem um `goal` de uma frase, com o número a observar
+  (barra 254 pisca no limite; barra 3 pisca no limite, 1–2 podem sumir), e
+  `fixes`, uma linha por sintoma com o controle e o sentido.
+  - O passo de gama virou um quadrado 186 grande dentro das listras: "sumiu"
+    quer dizer gama 2,2; mais escuro → suba Gamma (software); mais claro →
+    desça. A rampa nunca move as listras pretas e brancas, só o quadrado.
+  - Na tela cheia, a faixa inferior mostra o objetivo.
+  - O equilíbrio de cinza traz o mapa matiz → canal a baixar.
+- **Alternativas:** manter a fileira de candidatos 176–196 (mede, mas pede uma
+  comparação que o usuário não conseguiu fazer).
+- **Consequências:** menos texto e uma pergunta respondível por passo.
+
+### D32 — Interruptor do Gerenciador de Tarefas conta; geometria em entrada digital não existe
+
+Duas causas, achadas na mesma sessão (10/10), de dois sintomas do usuário: "o
+início com o Windows está ligado mas o app não abre" e "ao abrir, diz que há
+mudanças não salvas, mas não há nada para salvar".
+
+**a) Início com o Windows**
+
+- **Contexto:** nenhum boot desde 03/10 registrou `started with Windows: True`.
+  A chave Run estava certa e o `.exe` existia. Em
+  `HKCU\…\Explorer\StartupApproved\Run` o valor `monitorctl` era `03…`
+  (desligado), gravado em 03/10 às 11:26, segundos depois de várias entradas do
+  Edge — alguém desligou em *Aplicativos de inicialização*. O Explorer pula um
+  valor Run desligado ali. Em 05/10 o usuário religou pelo app: o
+  `enable()` reescreveu só a chave Run, o interruptor continuou desligado, e
+  `is_enabled()` (que só olhava a chave Run) mostrava a caixa marcada.
+- **Decisão:**
+  - `is_enabled()` = valor Run existe **e** o interruptor não está desligado
+    (primeiro byte do `REG_BINARY` ímpar = desligado).
+  - `enable()` apaga o interruptor desligado: ligar no app é um pedido
+    explícito. Apagar, e não escrever `02 00…`, porque um valor Run sem
+    entrada no `StartupApproved` inicia — foi assim que o app iniciou com o
+    Windows em 02/10, antes de existir a entrada.
+  - `disable()` apaga os dois. `repair()` não toca no interruptor: segue uma
+    pasta movida, nunca religa o que o usuário desligou.
+  - `autostart status` (CLI) diz quando está desligado no Gerenciador.
+- **Alternativas:** só avisar na janela que o Gerenciador desligou (o usuário
+  teria de achar o interruptor sozinho); ignorar o `StartupApproved` (o
+  formato não é documentado) — mas é ele que decide se o Windows inicia o app.
+- **Consequências:** a caixa da janela e do menu mostra a verdade; o formato
+  não documentado é lido só no primeiro byte, e uma leitura que falha vira
+  `AutostartError`, já tratado pelos chamadores.
+
+**b) "Unsaved changes" fantasma**
+
+- **Contexto:** o ASUS está em HDMI (que ele chama de "DVI 2"). Nessa entrada
+  os controles de geometria VGA (`0x20`, `0x30`, `0x0E`, `0x3E`…) são inertes e
+  o firmware devolve lixo: o perfil guardou `horizontal_position` = 181 (acima
+  do máximo de 100), e o monitor passou a ler 189 sozinho. A janela comparava
+  e acusava "unsaved changes". Cada Restore do usuário ("7 written" no log: 6
+  voláteis do TCL + 1) escrevia 181 num controle que
+  `docs/monitors/asus-vs248.md` manda não escrever fora de VGA.
+- **Decisão:** `vcp.inert_keys(input_source)`: numa entrada **certamente
+  digital** (DVI, DisplayPort, HDMI) os controles da categoria Geometry são
+  inertes e:
+  - o Save não os guarda;
+  - o Restore e a troca de perfil não os escrevem — decidido por uma leitura
+    nova da entrada, só quando o perfil tem geometria (a entrada muda pelos
+    botões do monitor, e o cache pode ter dias);
+  - a janela não os compara (`saved_value`, `differences`), o que cobre a
+    etiqueta, o ↺, a pergunta ao sair e a pergunta ao trocar de perfil.
+  - Entrada desconhecida (não lida, código fora do MCCS) mantém o
+    comportamento anterior.
+- **Alternativas:** um quirk por modelo (o defeito é de qualquer monitor com
+  VGA, não do ASUS); esconder a geometria da janela (ainda mostraria o lixo
+  ao alternar); guardar o valor antigo no Save (o que está nos perfis atuais
+  já é lixo lido em HDMI).
+- **Consequências:**
+  - Os perfis atuais do ASUS ainda guardam a geometria lida em HDMI; ela é
+    ignorada enquanto a entrada for digital e sai do perfil no próximo Save.
+  - Um perfil salvo em VGA, restaurado com o monitor em HDMI, troca a entrada
+    para VGA (o achado 6 de §11) mas não restaura a geometria. Nenhum perfil
+    atual está nesse caso.
+  - DVI-I analógico seria tratado como digital; nenhum monitor visto o usa.
+
+### D33 — O que fica em espera não se perde; a janela fala em identidade, não em posição
+
+Fecha os achados 8–11 da revisão lógica de 10/10, com as escolhas do usuário
+(11/10).
+
+**a) Keeper suspenso fica devendo (achado 8)**
+
+- **Contexto:** com Pause, ou com a janela aberta e alterações não salvas, o
+  keeper não escrevia, e o que acontecia nesse meio-tempo se perdia: um evento
+  (telas religadas) só re-enumerava, e no modo *detect* nem havia ping. Ao
+  despausar, ou quando o drift sumia pelo ↺, nada reaplicava até o próximo
+  evento — com o TCL já de fábrica.
+- **Decisão (usuário: "só reaplicar tudo funciona"):** o keeper guarda uma
+  dívida (`owed`), paga com **um push completo via 50** — o mesmo de um evento —
+  assim que fica livre:
+  - evento durante a suspensão → deve;
+  - Pause observado por qualquer tick ou evento → deve (pausado nada é
+    observado, então ao despausar reaplica uma vez);
+  - suspenso só pela janela, no modo *detect*: **continua pingando** (leitura,
+    não escrita); monitor que voltou → deve. Sem rescan: ele redesenharia a
+    janela sob o usuário;
+  - sem perfil salvo, nada é devido.
+  - Pagamento: `Keeper.catch_up()`, chamado pelo worker quando a janela libera o
+    keeper (`set_editing` de verdadeiro para falso → `Worker.nudge`), quando as
+    configurações mudam (despausar) e no início de cada tick.
+- **Alternativas:** lembrar só o evento e reaplicar só nele (não cobre o
+  religamento que só o ping vê); reaplicar ao fim de toda suspensão (piscada a
+  cada Save, que já empurra os voláteis).
+- **Consequências:** despausar dá uma piscada (pivô 50) se houve tick ou evento
+  durante a pausa. Um monitor ainda desligado na hora do pagamento fica
+  "perdido" e é empurrado pelos ticks quando responder.
+
+**b) Jobs da janela resolvem o monitor pelo EDID (achado 9)**
+
+- **Contexto:** escrita de slider, Apply, troca/criação/renomeação/exclusão de
+  perfil levavam o id de posição (`display1`) para a fila do barramento. Um
+  rescan do keeper na frente, com renumeração, fazia o job agir no outro
+  monitor — inclusive escrever no ASUS. E o resultado voltava para a linha
+  daquela posição, que após o redesenho podia ser do outro monitor.
+- **Decisão:** `MonitorService.resolve(hardware_id, monitor_id)` acha o id
+  *atual* pela identidade EDID dentro do job; sem identidade (EDID não lido ou
+  painéis idênticos) usa a posição; monitor sumido levanta `MonitorNotFound`
+  em vez de escrever no que ocupou a posição. Na janela, `locator()` monta isso
+  no envio; cada `FeatureRow` guarda a identidade (`ident`), e todo resultado
+  volta por ela (`live_row`, `_monitor_id_of`), contra a lista que a janela
+  mostra.
+- **Alternativas:** bloquear o rescan do keeper enquanto há job da janela (o
+  rescan vem de um evento real e renova handles mortos); recarregar a janela
+  antes de cada job (não fecha a corrida).
+- **Consequências:** os perfis devolvidos pelo barramento podem vir com ids
+  novos até a recarga que o keeper já pede; a janela recarrega logo depois.
+
+**c) Save, fechar e sair esperam as mudanças chegarem (achado 11)**
+
+- **Contexto:** um arraste espera 250 ms (debounce) e depois o barramento.
+  `Ctrl+S` ou fechar nesse intervalo salvava/comparava os valores de antes.
+- **Decisão (ideia do usuário: "os 250 ms são para aplicar, não para
+  salvar"):** Save, Apply, fechar, sair, trocar de perfil e New **enviam já** a
+  mudança que ainda esperava o debounce (e o número digitado e não confirmado
+  no campo) e **esperam** as escritas em voo voltarem antes de agir
+  (`_after_edits`). O Restore **descarta** o que esperava o debounce (pousaria
+  depois e o desfaria) e também espera o que está em voo. A janela conta as
+  escritas em voo e os debounces pendentes de todas as linhas, inclusive as que
+  um redesenho substituiu.
+- **Alternativas:** o Save gravar os valores da tela sem passar pelo monitor
+  (salvaria um valor que o monitor pode ter recusado ou ajustado).
+- **Consequências:** o que é salvo é sempre um valor confirmado pelo monitor,
+  e é o que a tela mostrava ao apertar Save.
+
+**d) Save/Restore com a janela ocupada (achado 10)**
+
+- **Contexto:** Save/Restore da bandeja (ou `Ctrl+S`) com a janela aberta e
+  ocupada — uma releitura, por exemplo — eram ignorados sem aviso.
+- **Decisão:** ficam na fila e rodam quando a operação atual termina; a barra
+  de status diz "Save will run when the current operation ends…".
+
+**e) Apply sempre clicável; indicador no lugar do cursor ocupado**
+
+- **Pedido do usuário:** um Apply manual, e nada de cursor "carregando" (parece
+  travado).
+- **Decisão:** com pendências, Apply as escreve como antes. Sem pendências,
+  **reenvia o que a janela mostra para os controles que um monitor esquece**
+  (voláteis via 50, ajustes de GPU fora do neutro) — `reassert_current`, o
+  mesmo empurrão do fim do Save, mas com os valores da tela, salvos ou não.
+  Controles que o monitor guarda não são escritos: a leitura deles é a
+  verdade, e reescrever só gastaria EEPROM. O cursor não muda mais: um arco
+  gira ao lado da mensagem na barra de status e, enquanto não há abas de
+  monitor, no lugar delas.
+
 ---
 
 ## 7. Medições
@@ -690,6 +906,22 @@ Formato: **contexto → decisão → alternativas descartadas → consequências
 | 47 | Ligar Auto apply com a janela ocupada deixava pendências velhas que voltavam no Save | Revisão | Caixa bloqueada enquanto ocupada ou com escrita em voo; escrita automática limpa a pendência |
 | 48 | Trocar de perfil sem aplicar comparava com o cache; descartava pendências sem perguntar | Revisão | Reler o monitor; incluir pendências na pergunta |
 | 49 | Calibração: redesenho de 105 ms a cada evento de redimensionar; Esc fechava o guia | Revisão | Redesenho com debounce, gradiente com 256 faixas; Esc só sai da tela cheia |
+| 50 | App abortava ao arrastar o slider rápido (`0xc0000409`, nada no log) | Usuário; Event Viewer + minidump | Handler ctypes da janela oculta chamava o Tk dentro do `mainloop` (D30); `faulthandler` em `crash.log` |
+| 51 | Contorno pontilhado em botões e caixas após clique | Usuário | O `clam` desenha o elemento `*.focus`; removido dos layouts de botão, check, radio, menubutton e aba, com foco em cor de destaque |
+| 52 | `settings.json` com bytes inválidos impedia o app de iniciar; BOM tornava `profiles.json` ilegível | Revisão (03/10) | Ler bytes, decodificar `utf-8-sig` dentro do `try`; tratar `ValueError/TypeError/OverflowError/RecursionError` como ilegível |
+| 53 | Início com o Windows ligado no app, mas o app nunca iniciava (desde 03/10) | Usuário; `StartupApproved\Run` = `03…` | Interruptor desligado no Gerenciador de Tarefas era ignorado por `is_enabled`/`enable` (D32a) |
+| 54 | "Unsaved changes" ao abrir sem nada mudado; Restore escrevia geometria VGA no ASUS em HDMI | Usuário; `list` do CLI vs `profiles.json` | Geometria em entrada digital é lixo: fora do Save, do Restore e da comparação (D32b) |
+| 55 | Controle cuja leitura falhou na sondagem (monitor ligando) era pulado pelo upkeep e pelo Restore até um Rescan manual — inclusive os ganhos voláteis do TCL | Revisão lógica (10/10) | O carry-over leva o `read_failed` adiante a cada evento; `_put_back` agora relê esse controle antes de decidir, em qualquer modo |
+| 56 | Restore dizia "already correct" para o gama por software depois que reset de driver, Night Light ou um jogo trocou a rampa | Revisão lógica | O valor do gama é virtual; `get` passa a reportar neutro quando a rampa no dispositivo não é mais a nossa (D27) |
+| 57 | `monitorctl save` (CLI) gravava brilho/contraste/gama por software como 50 em todos os perfis | Revisão lógica | Esses valores vivem no processo do app; o CLI mantém os salvos (`keep_saved`) e recusa `set gpu_sw_*`, que o próprio fechamento desfaria |
+| 58 | Com Auto apply desligado, trocar de perfil punha a geometria inerte na fila e o Apply a escrevia no ASUS em HDMI | Revisão lógica | `_stage_profile` ficou fora do D32b; filtra os inertes como o serviço |
+| 59 | Debounce/foco disparado depois de um redesenho, com Auto apply desligado: `TclError` e pendência invisível que o próximo Apply/Save escrevia | Revisão lógica | `_commit` repassa a mudança à linha viva, como `_written` já fazia |
+| 60 | Tick do keeper entre a escrita do usuário e o drain do resultado desfazia a escrita (rewrite) ou um Save encadeado após Apply | Revisão lógica | Suspender o keeper também enquanto a janela está ocupada ou com escrita em voo |
+| 61 | Falha do registro ao alternar o início com o Windows pela bandeja invertia a caixa da janela mesmo assim | Revisão lógica | Atualizar a caixa só com o que o registro aceitou |
+| 62 | Religamento do TCL durante Pause ou edição nunca era reaplicado | Revisão lógica (achado 8) | Suspenso não é cego: o keeper fica devendo e paga ao ficar livre (D33a) |
+| 63 | Job da janela na fila atrás de um rescan com renumeração agia no outro monitor | Revisão lógica (achado 9) | Resolver pelo EDID dentro do job; resultados voltam pela identidade (D33b) |
+| 64 | Save/Restore da bandeja com a janela ocupada sumiam sem aviso | Revisão lógica (achado 10) | Enfileirar até a operação terminar (D33d) |
+| 65 | `Ctrl+S`/fechar até 250 ms após um arraste perdia o arraste; Restore logo após um arraste era desfeito por ele | Revisão lógica (achado 11) | Enviar já o que esperava o debounce e esperar as escritas em voo; o Restore descarta (D33c) |
 
 Lição de processo: editar texto com barra invertida por heredoc no bash corrompe
 escapes (`\\.\DISPLAY1`, `\n`, `\d`) — usar as ferramentas de edição.
@@ -698,7 +930,7 @@ escapes (`\\.\DISPLAY1`, `\n`, `\d`) — usar as ferramentas de edição.
 
 ## 9. Qualidade e testes
 
-- **398 testes**, sem hardware, em ~37 s. `tests/fakes.py` simula monitores,
+- **458 testes**, sem hardware, em ~60 s. `tests/fakes.py` simula monitores,
   inclusive o TCL (ignora escrita repetida, tem EDID, conta leituras e escritas).
 - A janela é testada **de verdade**: Tk real, transparente, com um worker que
   roda os jobs na hora.
@@ -711,9 +943,9 @@ escapes (`\\.\DISPLAY1`, `\n`, `\d`) — usar as ferramentas de edição.
 
 | Arquivo | Foco |
 |---|---|
-| `test_keeper.py` | detect/rewrite, monitor que some/volta, handle morto, monitor desligado durante evento, ids renumerados, re-enumeração lenta, suspensão, nenhuma escrita em monitor estável |
-| `test_worker.py` | ordem, agrupamento de eventos, intervalo, sobrevivência, parada |
-| `test_window.py` | render, escrita, validação, Save via 50, diferenças, Restore, fechar, settings, tema, calibração |
+| `test_keeper.py` | detect/rewrite, monitor que some/volta, handle morto, monitor desligado durante evento, ids renumerados, re-enumeração lenta, suspensão e o que ela deve, nenhuma escrita em monitor estável |
+| `test_worker.py` | ordem, agrupamento de eventos, intervalo, `nudge`, sobrevivência, parada |
+| `test_window.py` | render, escrita, validação, Save via 50, diferenças, Restore, fechar, settings, tema, calibração, mudanças em voo antes de Save/Restore, renumeração no meio da sessão, Apply sem pendências |
 | `test_snapshot.py` | arquivo, pareamento, voláteis, upkeep, ping, cache vazio/velho, carry-over |
 | `test_buslock.py` | exclusão, reentrância, dono morto |
 | `test_edid.py` | blocos reais dos dois monitores, entradas inválidas, quirks |
@@ -730,6 +962,7 @@ escapes (`\\.\DISPLAY1`, `\n`, `\d`) — usar as ferramentas de edição.
 | `%LOCALAPPDATA%\monitorctl\snapshot.json` | Legado (antes dos perfis); lido só enquanto `profiles.json` não existe |
 | `%LOCALAPPDATA%\monitorctl\settings.json` | Preferências do app |
 | `%LOCALAPPDATA%\monitorctl\monitorctl.log` (+ `.1`) | Log do app |
+| `%LOCALAPPDATA%\monitorctl\crash.log` | Pilha Python de um abort do interpretador (`faulthandler`); vazio se nunca houve |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\monitorctl` | Iniciar com o Windows |
 | Tarefa agendada `monitorctl-restore` | Legado da 0.1; removida ao ativar o início com o Windows |
 | `dist/monitorctl/`, `dist/monitorctl-<v>-win64.zip` | Saída do build (apagada a cada build) |
@@ -745,6 +978,33 @@ escapes (`\\.\DISPLAY1`, `\n`, `\d`) — usar as ferramentas de edição.
   usar o modo *rewrite*.
 - Copiar a pasta para um local fixo e ativar o **início com o Windows**.
 - Decidir se o snapshot de 30/09 deve ser substituído pelo estado atual.
+- A chave Run aponta para `dist\monitorctl` (religada em 05/10), que o próximo
+  build apaga; o interruptor do Gerenciador de Tarefas está desligado desde
+  03/10 (D32a). Ligar de novo pelo app, de preferência de uma cópia fora de
+  `dist/`.
+
+**Achados da revisão de 03/10 ainda abertos** (pedem decisão do usuário):
+
+1. Uma resposta "não suportado" com bytes zerados (comum logo após ligar)
+   marca o controle como sem suporte pela sessão inteira. O Save da bandeja
+   tira o controle do perfil, e o keeper deixa de reaplicá-lo.
+2. Uma escrita em dois passos que falha no segundo deixa o controle no pivô
+   (50), com o cache dizendo o valor final. No modo *detect* nada repete até o
+   próximo evento.
+3. Um único ping falho conta como "desligou". Ao voltar, há um push completo:
+   12 escritas e um flash de cor visível.
+4. Um fim abrupto (como o crash do D30) deixa a rampa gama de software na
+   tela. O próximo início a adota como "original". O reaplicar também apaga a
+   rampa morna do Night Light até ele reescrever.
+5. O autostart, a partir de `dist/` ou da fonte, se aponta para lá. Nada
+   instala uma cópia fora de `dist/`. O `repair` não remove a tarefa legada.
+6. Restore e troca de perfil gravam `input_source`: um perfil salvo em HDMI
+   tira o TCL desta entrada.
+7. Um monitor esquecível removido de vez provoca uma releitura das
+   capabilities a cada 5 min, para sempre (só leitura).
+
+Os achados 8–11 da revisão lógica de 10/10 foram resolvidos em 11/10 (D33,
+bugs 62–65).
 
 **Limitações conhecidas**
 

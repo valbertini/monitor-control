@@ -14,6 +14,7 @@ from tkinter import ttk
 from unittest import mock
 
 from monitorctl.app.settings import AppSettings, RefreshMode, SettingsStore, Theme
+from monitorctl.app.window import DOT
 from monitorctl.ddc.edid import EdidInfo
 from monitorctl.ddc.profiles import ProfileStore
 from monitorctl.ddc.service import MonitorService, Pacing
@@ -46,6 +47,28 @@ class InlineWorker:
 
     def reschedule(self) -> None:
         pass
+
+
+class HoldingWorker(InlineWorker):
+    """Queues jobs until :meth:`run_all`: the bus is busy elsewhere."""
+
+    def __init__(self, service: MonitorService) -> None:
+        super().__init__(service)
+        self.queued: list[tuple] = []
+
+    def submit(self, run, on_done=None, *, label: str = "") -> None:
+        self.labels.append(label)
+        self.queued.append((run, on_done))
+
+    def run_all(self) -> None:
+        while self.queued:
+            run, on_done = self.queued.pop(0)
+            try:
+                result, error = run(self.service), None
+            except Exception as exc:
+                result, error = None, exc
+            if on_done is not None:
+                on_done(result, error)
 
 
 class Bridge:
@@ -92,7 +115,7 @@ class WindowTestCase(unittest.TestCase):
             ignores_same_value=frozenset({0x16}),
         )
         self.service = MonitorService(
-            FakeBackend([self.tcl]),
+            FakeBackend([self.tcl, *self.more_monitors()]),
             pacing=NO_PACING,
             gpu=GpuController([]),
             profiles=ProfileStore(),
@@ -105,6 +128,10 @@ class WindowTestCase(unittest.TestCase):
         self.window = MainWindow(self.root, self.bridge, icon_path=None)
         self.window.show()
         self.root.update()
+
+    def more_monitors(self) -> list[FakeMonitor]:
+        """Monitors connected besides the TCL, after it in the list."""
+        return []
 
     def _cancel_timers(self) -> None:
         for timer in self.root.tk.splitlist(self.root.tk.call("after", "info")):
@@ -450,6 +477,24 @@ class TestWriting(WindowTestCase):
         self.assertEqual(row.confirmed, 45)
         self.assertEqual(row.scale_var.get(), 45)
 
+    def test_the_keeper_waits_while_a_write_is_on_its_way(self) -> None:
+        """Until the result is drained the drift it makes is unknown; a check
+        run in between would put the saved value back on the monitor."""
+        held: list[bool] = []
+        submit = self.bridge.worker.submit
+
+        def watching(run, on_done=None, *, label: str = "") -> None:
+            held.append(self.bridge.editing[-1])
+            submit(run, on_done, label=label)
+
+        self.bridge.worker.submit = watching
+        row = self.row("brightness")
+        row.text_var.set("45")
+        row._on_text_commit()
+        self.root.update()
+        self.assertEqual(held, [True])
+        self.assertFalse(self.bridge.editing[-1])  # nothing saved: no drift
+
     def test_an_out_of_range_value_is_refused_and_reverted(self) -> None:
         row = self.row("brightness")
         self.tcl.writes.clear()
@@ -531,6 +576,22 @@ class TestSaveAndRestore(WindowTestCase):
         self.window.record(self.window.monitors[0].id, "brightness", 61)
         tip = self.window._snapshot_tooltip()
         self.assertIn("TestDisplay · Brightness: saved 30, now 61", tip)
+
+    def test_geometry_on_a_digital_input_is_never_unsaved(self) -> None:
+        """A profile from before D32 holds geometry noise read on HDMI; the
+        noise moving (181 -> 189) is not a change anyone made."""
+        self.tcl.values[0x20], self.tcl.maxima[0x20] = 181, 255
+        self.window.load(probe=True)
+        self.root.update()
+        self.window.save()  # input unknown: geometry is saved, as before D32
+        monitor_id = self.window.monitors[0].id
+        self.window.record(monitor_id, "horizontal_position", 189)
+        self.assertTrue(self.window.drifted())
+
+        self.window.record(monitor_id, "input_source", 0x04)  # ASUS's HDMI
+        self.assertFalse(self.window.drifted())
+        self.assertEqual(self.window.snapshot_label.cget("text"), "all saved")
+        self.assertIsNone(self.window.saved_value(monitor_id, "horizontal_position"))
 
     def test_restore_puts_the_saved_values_back(self) -> None:
         self.window.save()
@@ -723,7 +784,8 @@ class TestApplyOnDemand(WindowTestCase):
         self.assertEqual(self.tcl.values[0x10], 61)
         self.assertEqual(self.tcl.values[0x12], 40)
         self.assertEqual(self.window.staged, {})
-        self.assertIn("disabled", self.window.apply_button.state())
+        self.assertEqual(self.window.apply_button.cget("text"), "Apply")
+        self.assertIn("disabled", self.window.discard_button.state())
 
     def test_changing_back_is_no_change(self) -> None:
         self.type_value("brightness", 61)
@@ -740,6 +802,21 @@ class TestApplyOnDemand(WindowTestCase):
         self.type_value("brightness", 61)
         self.window.render()
         self.assertEqual(self.row("brightness").text_var.get(), "61")
+
+    def test_a_change_made_before_a_redraw_waits_on_the_row_on_screen(self) -> None:
+        """The debounce fires after a keeper reload redrew the rows: the
+        change must show as waiting, not hide in ``staged`` behind a dead row."""
+        old = self.row("brightness")
+        old._debounce(40)
+        self.window.render()
+        self.root.after(400)
+        self.root.update()
+        live = self.row("brightness")
+        self.assertIsNot(live, old)
+        self.assertEqual(live.text_var.get(), "40")
+        self.assertIn(DOT, live.name_label.cget("text"))
+        self.assertEqual(self.window.apply_button.cget("text"), "Apply (1)")
+        self.assertEqual(self.tcl.writes, [])
 
     def test_switching_auto_apply_back_on_applies_what_waits(self) -> None:
         self.type_value("brightness", 61)
@@ -854,6 +931,221 @@ class TestApplyOnDemand(WindowTestCase):
         self.assertNotEqual(self.root.state(), "withdrawn")
 
 
+class TestApplyOnDemandOnADigitalInput(WindowTestCase):
+    """D32: geometry is noise on HDMI, so a profile switch never stages it."""
+
+    caps = "(prot(monitor)type(LCD)model(VS248)vcp(10 20 60(01 04))mccs_ver(2.1))"
+
+    def test_switching_profiles_leaves_inert_geometry_out(self) -> None:
+        self.tcl.values.update({0x20: 40, 0x60: 0x01})  # VGA: geometry is real
+        self.tcl.maxima.update({0x20: 100, 0x60: 0x04})
+        self.window.load(probe=True)
+        self.window.save()
+        monitor_id = self.window.monitors[0].id
+        with mock.patch.object(self.window, "ask_name", return_value="Night"):
+            self.window.new_profile(monitor_id)
+        self.tcl.values.update({0x20: 189, 0x60: 0x04})  # HDMI: noise
+        self.window.load(probe=True)
+        self.window.auto_apply_var.set(False)
+        self.window._toggle_auto_apply()
+        self.tcl.writes.clear()
+
+        self.window.switch_profile(monitor_id, "Default")
+        self.window.apply_staged()
+        self.root.update()
+
+        self.assertNotIn(0x20, [code for code, _value in self.tcl.writes])
+
+
+class TestChangesNotLandedYet(WindowTestCase):
+    """A drag waits 250 ms to settle, then for the bus: Save, Restore and
+    closing must not act on the values as they were before it."""
+
+    def drag(self, key: str, value: int) -> None:
+        row = self.row(key)
+        row.scale_var.set(value)
+        row._on_scale(str(value))  # the debounce is now pending
+
+    def test_save_right_after_a_drag_saves_the_drag(self) -> None:
+        self.drag("brightness", 64)
+        self.window.save()
+        self.root.update()
+        self.assertEqual(self.tcl.values[0x10], 64)
+        saved = self.service.saved_snapshot().monitors[0].values["brightness"]
+        self.assertEqual(saved, 64)
+
+    def test_save_waits_for_a_write_still_on_its_way(self) -> None:
+        worker = HoldingWorker(self.service)
+        self.bridge.worker = worker
+        self.drag("brightness", 64)
+        self.window.save()
+        self.assertEqual(worker.labels, ["Writing Brightness"])  # no save yet
+        worker.run_all()  # the write lands, then the save it held runs
+        self.assertEqual(worker.labels, ["Writing Brightness", "Saving"])
+        saved = self.service.saved_snapshot().monitors[0].values["brightness"]
+        self.assertEqual(saved, 64)
+
+    def test_a_number_typed_but_not_committed_is_saved(self) -> None:
+        row = self.row("brightness")
+        for char in "77":
+            row._on_key(mock.Mock(char=char, keysym=char))
+        row.text_var.set("77")
+        self.window.save()  # Ctrl+S with the focus still in the field
+        self.root.update()
+        saved = self.service.saved_snapshot().monitors[0].values["brightness"]
+        self.assertEqual(saved, 77)
+
+    def test_closing_right_after_a_drag_asks_about_it(self) -> None:
+        self.window.save()
+        self.drag("brightness", 64)
+        with mock.patch("tkinter.messagebox.askyesnocancel", return_value=None) as ask:
+            self.window.close()
+        ask.assert_called_once()
+        self.assertNotEqual(self.root.state(), "withdrawn")
+
+    def test_restore_drops_a_drag_still_settling(self) -> None:
+        """Landing after the restore, it would undo it."""
+        self.window.save()
+        self.tcl.writes.clear()
+        self.drag("brightness", 80)
+        self.window.restore()
+        self.root.after(400)
+        self.root.update()
+        self.assertEqual(self.tcl.values[0x10], 30)
+        self.assertNotIn((0x10, 80), self.tcl.writes)
+        self.assertEqual(self.row("brightness").text_var.get(), "30")
+
+
+class TestWhileBusy(WindowTestCase):
+    def test_a_save_asked_for_meanwhile_runs_when_it_ends(self) -> None:
+        """From the tray or Ctrl+S, while a rescan runs: once ignored silently."""
+        self.window._set_busy(True, "Reading every control of every monitor…")
+        self.window.save()
+        self.assertIsNone(self.service.saved_snapshot())
+        self.assertIn("will run", self.window.status_label.cget("text"))
+        self.window._set_busy(False)
+        self.root.update()
+        self.assertIsNotNone(self.service.saved_snapshot())
+
+    def test_a_spinner_says_so_not_the_pointer(self) -> None:
+        self.window._set_busy(True, "Reading…")
+        self.root.update()
+        self.assertEqual(str(self.root.cget("cursor")), "")
+        self.assertTrue(self.window.spinner.turning)
+        self.assertTrue(self.window.spinner.canvas.winfo_ismapped())
+        self.window._set_busy(False)
+        self.root.update()
+        self.assertFalse(self.window.spinner.turning)
+        self.assertFalse(self.window.spinner.canvas.winfo_ismapped())
+
+
+class TestApplyWithNothingWaiting(WindowTestCase):
+    """Apply can always be pressed: it makes the screen show the window."""
+
+    def test_it_can_be_pressed_with_auto_apply_on(self) -> None:
+        self.assertNotIn("disabled", self.window.apply_button.state())
+        self.assertIn("disabled", self.window.discard_button.state())
+
+    def test_it_pushes_the_controls_a_monitor_forgets(self) -> None:
+        self.tcl.writes.clear()
+        self.window.apply()
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 70)])
+
+    def test_it_pushes_what_is_shown_not_what_is_saved(self) -> None:
+        self.window.save()  # red gain 70
+        row = self.row("red_gain")
+        row.text_var.set("66")
+        row._on_text_commit()
+        self.root.update()
+        self.tcl.writes.clear()
+        self.window.apply()
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 66)])
+
+
+ASUS = EdidInfo("ACI", 0x2498, 0, "SERIAL-B", "VS248")
+
+
+class TestWindowsRenumbersMidSession(WindowTestCase):
+    """A job waits in the bus queue; a keeper rescan ahead of it may hand its
+    monitor's position to the other one.  It must still reach its own."""
+
+    def more_monitors(self) -> list[FakeMonitor]:
+        self.asus = FakeMonitor(
+            device=r"\\.\DISPLAY2",
+            capabilities=CAPS,
+            values={0x10: 80, 0x12: 50, 0x14: 0x05, 0x16: 50},
+            maxima={0x10: 100, 0x12: 100, 0x14: 0x0D, 0x16: 100},
+            edid=ASUS,
+        )
+        return [self.asus]
+
+    def renumber(self) -> None:
+        self.tcl.device, self.asus.device = self.asus.device, self.tcl.device
+        self.service.refresh(probe=False)
+
+    def test_a_slider_write_reaches_its_own_monitor(self) -> None:
+        worker = HoldingWorker(self.service)
+        self.bridge.worker = worker
+        row = self.row("brightness")  # the TCL's
+        row.text_var.set("45")
+        row._on_text_commit()
+        self.root.update()
+        self.renumber()
+        worker.run_all()
+        self.assertEqual(self.tcl.values[0x10], 45)
+        self.assertEqual(self.asus.values[0x10], 80)
+        self.assertEqual(row.confirmed, 45)
+
+    def test_the_result_lands_on_its_own_row_after_the_redraw(self) -> None:
+        worker = HoldingWorker(self.service)
+        self.bridge.worker = worker
+        row = self.row("brightness")
+        row.text_var.set("45")
+        row._on_text_commit()
+        self.root.update()
+        self.renumber()
+        self.window.keeper_changed(True, "display configuration changed", 0)
+        worker.run_all()  # the write, then the reload behind it
+        self.root.update()
+        by_edid = {m.hardware_id: m.id for m in self.window.monitors}
+        tcl_row = self.window.rows[(by_edid[TCL.hardware_id], "brightness")]
+        asus_row = self.window.rows[(by_edid[ASUS.hardware_id], "brightness")]
+        self.assertEqual(tcl_row.text_var.get(), "45")
+        self.assertEqual(asus_row.text_var.get(), "80")
+
+    def test_apply_reaches_the_monitor_the_change_was_made_on(self) -> None:
+        self.window.auto_apply_var.set(False)
+        self.window._toggle_auto_apply()
+        row = self.row("brightness")
+        row.text_var.set("10")
+        row._on_text_commit()
+        self.root.update()
+        worker = HoldingWorker(self.service)
+        self.bridge.worker = worker
+        self.window.apply()
+        self.renumber()
+        worker.run_all()
+        self.assertEqual(self.tcl.values[0x10], 10)
+        self.assertEqual(self.asus.values[0x10], 80)
+
+    def test_a_monitor_gone_meanwhile_is_not_written_through_its_old_position(
+        self,
+    ) -> None:
+        worker = HoldingWorker(self.service)
+        self.bridge.worker = worker
+        row = self.row("brightness")
+        row.text_var.set("45")
+        row._on_text_commit()
+        self.root.update()
+        self.tcl.gone = True
+        self.asus.device = self.tcl.device
+        self.service._backend._monitors.remove(self.tcl)
+        self.service.refresh(probe=False)
+        worker.run_all()
+        self.assertEqual(self.asus.values[0x10], 80)
+        self.assertEqual(self.window.status_label.cget("style"), "StatusError.TLabel")
+
+
 class TestTabs(WindowTestCase):
     def test_a_selected_tab_draws_no_focus_ring(self) -> None:
         from tkinter import ttk as _ttk
@@ -883,6 +1175,28 @@ class TestSettingsTab(WindowTestCase):
         self.assertIs(self.bridge.settings.get().theme, Theme.LIGHT)
         self.window.toggle_theme()
         self.assertIs(self.bridge.settings.get().theme, Theme.DARK)
+
+    def test_nothing_draws_a_dotted_focus_ring(self) -> None:
+        # A click focuses buttons, check boxes and tabs; clam would then ring
+        # their label with dots.  Also after a theme switch.
+        from monitorctl.app.theme import FOCUS_RING_STYLES
+
+        self.window.toggle_theme()
+        style = ttk.Style(self.root)
+
+        def names(layout) -> list[str]:
+            return [
+                n
+                for name, options in layout
+                for n in (name, *names(options.get("children", [])))
+            ]
+
+        for name in (*FOCUS_RING_STYLES, "Accent.TButton", "Revert.TButton"):
+            with self.subTest(style=name):
+                elements = names(style.layout(name))
+                self.assertTrue(elements)
+                self.assertFalse([e for e in elements if e.endswith(".focus")])
+        self.window.toggle_theme()
 
 
 class TestCalibration(WindowTestCase):
@@ -936,16 +1250,49 @@ class TestCalibration(WindowTestCase):
         self.cal._tick()
         self.assertEqual(self.cal.canvas.itemcget(item, "fill"), colour)
 
-    def test_the_gamma_step_marks_the_standard(self) -> None:
+    def test_the_gamma_step_judges_one_square_against_the_stripes(self) -> None:
         from monitorctl.app.calibration import GAMMA_TARGET, STEPS
 
         self.cal.show(next(i for i, s in enumerate(STEPS) if "Gamma" in s.title))
+        canvas = self.cal.canvas
+        squares = [
+            i
+            for i in canvas.find_all()
+            if canvas.type(i) == "rectangle"
+            and canvas.itemcget(i, "fill") == "#" + f"{GAMMA_TARGET:02x}" * 3
+        ]
+        self.assertEqual(len(squares), 1)
+        texts = [
+            canvas.itemcget(i, "text")
+            for i in canvas.find_all()
+            if canvas.type(i) == "text"
+        ]
+        self.assertTrue(any("gamma 2.2" in t for t in texts))
+
+    def test_every_step_states_a_goal_and_how_to_fix_it(self) -> None:
+        from monitorctl.app.calibration import STEPS
+
+        for index, step in enumerate(STEPS):
+            with self.subTest(step=step.title):
+                self.cal.show(index)
+                self.assertTrue(self.cal.goal_label.cget("text").startswith("Goal: "))
+                for fix in step.fixes:
+                    self.assertIn(fix, self.cal.fixes_label.cget("text"))
+        # Every step after the preparation says what to move.
+        self.assertTrue(all(step.fixes for step in STEPS[1:]))
+
+    def test_full_screen_keeps_the_goal_in_view(self) -> None:
+        self.cal.show(1)
+        self.cal.toggle_fullscreen()
+        self.cal.top.update()
+        self.cal.draw()
         texts = [
             self.cal.canvas.itemcget(i, "text")
             for i in self.cal.canvas.find_all()
             if self.cal.canvas.type(i) == "text"
         ]
-        self.assertTrue(any(t.startswith(f"{GAMMA_TARGET}  ·  2.2") for t in texts))
+        self.assertTrue(any(self.cal.step.goal in t for t in texts))
+        self.cal._escape()
 
     def test_escape_only_leaves_full_screen(self) -> None:
         self.cal._escape()

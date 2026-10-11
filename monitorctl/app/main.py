@@ -8,10 +8,12 @@ never runs a second copy: it asks the first one to show its window and exits.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import logging.handlers
 import sys
 import threading
+from pathlib import Path
 
 from .. import __version__, autostart
 from ..fileio import state_directory
@@ -67,6 +69,28 @@ def _configure_logging(verbose: bool) -> None:
 
     sys.excepthook = log_unhandled
     threading.excepthook = log_thread
+    _enable_crash_log(directory)
+
+
+#: Kept open for the life of the process: faulthandler writes to it from the
+#: very moment the interpreter aborts, when nothing can be opened any more.
+_crash_log = None
+
+
+def _enable_crash_log(directory: Path) -> None:
+    """Record the Python stack of every thread if the interpreter aborts.
+
+    A fatal error - a native crash, or the interpreter giving up as it did
+    in the Tk threading crash of D30 - bypasses logging entirely and goes to
+    a stderr this windowless process does not have.  The log file then just
+    stops, and only Windows' event log says that anything happened.
+    """
+    global _crash_log
+    try:
+        _crash_log = open(directory / "crash.log", "a", encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        return
+    faulthandler.enable(file=_crash_log, all_threads=True)
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:

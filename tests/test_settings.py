@@ -96,6 +96,22 @@ class TestSettingsStore(unittest.TestCase):
             self.assertEqual(SettingsStore(self.path).get(), AppSettings())
         self.assertEqual(self.path.read_text(encoding="utf-8"), "{not json")
 
+    def test_damaged_bytes_give_defaults_instead_of_stopping_the_app(self) -> None:
+        # Read when the tray app starts: an error escaping here kept it from
+        # starting at all.
+        self.path.parent.mkdir(parents=True)
+        for raw in (b"\xff\xfe{", b"[" * 100_000):
+            with self.subTest(raw=raw[:8]):
+                self.path.write_bytes(raw)
+                with self.assertLogs("monitorctl.app.settings", level="WARNING"):
+                    self.assertEqual(SettingsStore(self.path).get(), AppSettings())
+
+    def test_a_byte_order_mark_is_accepted(self) -> None:
+        # Notepad and Windows PowerShell 5.1 write UTF-8 with one.
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b"\xef\xbb\xbf" + b'{"version": 1, "interval_minutes": 7}')
+        self.assertEqual(SettingsStore(self.path).get().interval_minutes, 7)
+
     def test_unwritable_location_keeps_the_change_in_memory(self) -> None:
         blocker = self.path.parent
         blocker.parent.mkdir(parents=True, exist_ok=True)

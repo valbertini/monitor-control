@@ -3,8 +3,9 @@
 The steps and their patterns come from the usual by-eye methods - the AVS HD 709
 clipping patterns, Lagom's LCD tests, ArgyllCMS's adjustment order, EIZO's
 preparation advice; ``docs/PESQUISA-CALIBRACAO.md`` has the sources.  Each step
-says what to look at, what "right" looks like and which control to move, and
-the window is meant to be dragged onto the monitor being adjusted and made
+states one goal, as concretely as its pattern allows ("bar 3 blinks, but only
+just"), then a line per thing that can be wrong and the control that fixes
+it, and which way - no explanations to read while adjusting (D31).  The window is meant to be dragged onto the monitor being adjusted and made
 full screen (F11): a pattern only says something about the screen it is on.
 
 Patterns are exact sRGB values drawn on a canvas.  The process is DPI aware, so
@@ -37,10 +38,11 @@ HIGHLIGHT_BARS = (235, *range(240, 255))
 #: Lagom's static squares, for the same ends without blinking.
 SHADOW_SQUARES = (*range(1, 16), 20, 25, 30, 40)
 HIGHLIGHT_SQUARES = tuple(range(244, 255))
-#: Solid greys beside the gamma lines.  Black and white lines average half the
-#: light; at gamma 2.2 that is 186 (188 with the sRGB curve).
-GAMMA_SOLIDS = (176, 181, 186, 191, 196)
+#: The solid grey inside the gamma stripes.  Black and white lines average half
+#: the light; at gamma 2.2 that is 186 (188 with the sRGB curve).
 GAMMA_TARGET = 186
+#: Strip at the bottom of a full-screen step: its goal and the keys.
+CAPTION_HEIGHT = 48
 
 
 def _grey(level: int) -> str:
@@ -53,15 +55,17 @@ class Step:
 
     Attributes:
         title: Short name, for the step list.
-        look: What to look at, and what right looks like.
-        adjust: Which control to move, in order of preference.
+        goal: The one thing to look for, in a sentence - what "right" looks
+            like, as concretely as the pattern allows ("bar 3 just blinks").
+        fixes: "What you see -> which control to move, which way", one line
+            each, most likely first.
         background: The pattern's own field colour.
         draw: Name of the :class:`CalibrationWindow` method drawing it.
     """
 
     title: str
-    look: str
-    adjust: str
+    goal: str
+    fixes: tuple[str, ...]
     background: str
     draw: str
 
@@ -69,81 +73,86 @@ class Step:
 STEPS: tuple[Step, ...] = (
     Step(
         "Before you start",
-        "Check these five things before the tests, then move through the steps with "
-        "← →. F11 shows a step full screen; Esc leaves it.",
-        "",
+        "Do these five things once, then go through the steps with ← →.",
+        (),
         "#262b34",
         "_draw_preparation",
     ),
     Step(
         "1  Brightness",
-        "White should look like a sheet of paper in this room - bright, but not "
-        "glaring. The grey square in the middle is a half-tone for scale.",
-        "Monitor: Brightness (the backlight). It raises white and black together.",
+        "The white looks like a sheet of paper in this room: bright, not glaring.",
+        (
+            "Glaring, or your eyes tire → lower Brightness (monitor).",
+            "Dull or greyish → raise Brightness (monitor).",
+        ),
         "#ffffff",
         "_draw_brightness",
     ),
     Step(
         "2  Highlights",
-        "Every bar should blink, and white should stay neutral. If bars near 254 "
-        "stop blinking, or white turns pinkish or tinted, the top end is clipping. "
-        "At least the bars up to 250 should blink; the squares below should all be "
-        "distinguishable.",
-        "Monitor: Contrast. Raise it until bars stop blinking or white tints, then "
-        "lower it until they blink again.",
+        "Bar 254 still blinks, but only just. Every bar below it blinks clearly.",
+        (
+            "The last bars do not blink → lower Contrast (monitor) until they do.",
+            "White turns pinkish or tinted → lower Contrast (monitor).",
+            "No setting makes 254 blink → settle for 250.",
+        ),
         "#ffffff",
         "_draw_highlights",
     ),
     Step(
         "3  Shadows",
-        "Best in a dim room. Bars 1 and 2 may stay invisible on many panels; bar 3 "
-        "(at worst 5) and everything above it should blink. Black itself should stay "
-        "black, not grey.",
-        "Monitor: Black level / offset (all three together) if it has them, or its "
-        "gamma preset. Only then the PC: Gamma or Brightness (software). Afterwards, "
-        "check Highlights again - the two interact.",
+        "In a dim room: bar 3 blinks, but only just; 1 and 2 may stay invisible. "
+        "Black stays black.",
+        (
+            "Bar 3 (or up to 5) does not blink → raise Black level (monitor, all "
+            "three by the same amount), or else Gamma (software).",
+            "Bar 1 is clearly visible and black looks grey → lower the same control.",
+            "Then check step 2 again: the two interact.",
+        ),
         "#000000",
         "_draw_shadows",
     ),
     Step(
         "4  Grey balance",
-        "Every grey should look neutral - no pink, green or blue cast. Judge the "
-        "large light patch for the bright end and the dark one for the shadows. Your "
-        "eye adapts to the screen's white, so compare with something truly white or "
-        "grey in the room if you can.",
-        "First the colour temperature preset. Then Gain for the light greys: lower "
-        "the channel that is too strong rather than raising the others. Then Black "
-        "level / offset for the dark greys. Repeat once, they interact.",
+        "Every grey looks neutral: no pink, green or blue tint.",
+        (
+            "The light greys are tinted → lower that colour's Gain (monitor).",
+            "The dark greys are tinted → lower that colour's Black level (monitor).",
+            "Tint → colour to lower: pink Red · green Green · blue Blue · yellow Red "
+            "and Green · purple Red and Blue · cyan Green and Blue.",
+        ),
         "#7f7f7f",
         "_draw_grey_balance",
     ),
     Step(
         "5  Gamma",
-        "Step back or squint until the line pattern looks like a flat grey. The solid "
-        "square that disappears into it shows the monitor's gamma - each is labelled "
-        "with the gamma it stands for; 186 (2.2) is the standard. Needs full screen "
-        "at the native resolution.",
-        "Monitor: its gamma setting, if any. Otherwise the PC: Gamma (software).",
+        "Squint or step back until the stripes blur into a flat grey: the square in "
+        "the middle disappears into them.",
+        (
+            "The square is darker than the stripes → raise Gamma (software).",
+            "The square is lighter → lower Gamma (software).",
+        ),
         "#7f7f7f",
         "_draw_gamma",
     ),
     Step(
         "6  Gradients",
-        "Each ramp should be smooth, without bands, steps or colour fringes. Some "
-        "banding on an inexpensive panel is normal.",
-        "If bands appeared after the steps above, back the PC corrections off - every "
-        "software curve costs some smoothness.",
+        "Each ramp is smooth: no hard steps and no coloured bands.",
+        (
+            "Bands that were not there before the steps above → move the PC "
+            "(software) controls back toward 50.",
+            "A little banding on an inexpensive panel is normal.",
+        ),
         "#262b34",
         "_draw_gradients",
     ),
     Step(
         "7  Colours",
-        "Open, beside this window, a photo or an app whose colours you know well and "
-        "that has a good variety of them - your own photos, a familiar website, a "
-        "game. Faces, skies and greenery are the quickest to look wrong. The bars "
-        "below are the six colours at 75%.",
-        "Only for an obvious error: PC Saturation (vibrance), or the monitor's "
-        "six-axis Saturation and Hue if it has them.",
+        "Skin, sky and grass in a photo you know well look natural.",
+        (
+            "Clearly dull or clearly loud → Saturation (PC or monitor). Otherwise "
+            "leave it.",
+        ),
         "#262b34",
         "_draw_colours",
     ),
@@ -195,15 +204,15 @@ class CalibrationWindow:
         ttk.Checkbutton(
             nav, text="Blink", variable=self.blink_var, command=self._blink_toggled
         ).pack(side="right", padx=12)
-        self.look_label = ttk.Label(self.chrome, justify="left")
-        self.look_label.pack(anchor="w", fill="x", pady=(10, 2))
-        self.adjust_label = ttk.Label(self.chrome, style="Dim.TLabel", justify="left")
-        self.adjust_label.pack(anchor="w", fill="x")
+        self.goal_label = ttk.Label(self.chrome, style="Goal.TLabel", justify="left")
+        self.goal_label.pack(anchor="w", fill="x", pady=(10, 4))
+        self.fixes_label = ttk.Label(self.chrome, style="Dim.TLabel", justify="left")
+        self.fixes_label.pack(anchor="w", fill="x")
         self.chrome.bind(
             "<Configure>",
             lambda e: [
                 label.configure(wraplength=max(300, e.width - 40))
-                for label in (self.look_label, self.adjust_label)
+                for label in (self.goal_label, self.fixes_label)
             ],
         )
 
@@ -232,9 +241,8 @@ class CalibrationWindow:
     def show(self, index: int) -> None:
         self.index = max(0, min(len(STEPS) - 1, index))
         self.step_choice.current(self.index)
-        self.look_label.configure(text=self.step.look)
-        adjust = self.step.adjust
-        self.adjust_label.configure(text=f"Adjust - {adjust}" if adjust else "")
+        self.goal_label.configure(text=f"Goal: {self.step.goal}")
+        self.fixes_label.configure(text="\n".join(f"•  {fix}" for fix in self.step.fixes))
         self.draw()
 
     def go(self, delta: int) -> None:
@@ -330,15 +338,20 @@ class CalibrationWindow:
         )
 
     def _caption(self, width: int, height: int) -> None:
-        """In full screen the step bar is gone: name the step, small, at the
+        """In full screen the step bar is gone: the goal stays, small, at the
         bottom, on a strip of its own so it never sits on a pattern."""
         self.canvas.create_rectangle(
-            0, height - 34, width, height, fill="#000000", width=0
+            0, height - CAPTION_HEIGHT, width, height, fill="#000000", width=0
         )
         self.canvas.create_text(
             width / 2,
-            height - 17,
-            text=f"{self.step.title}    ← →  steps    F11 / Esc  leave full screen",
+            height - CAPTION_HEIGHT / 2,
+            text=(
+                f"{self.step.title}:  {self.step.goal}\n"
+                "← →  steps    F11 / Esc  leave full screen"
+            ),
+            justify="center",
+            width=width - 40,
             fill="#808080",
             font=("Segoe UI", 10),
         )
@@ -388,12 +401,12 @@ class CalibrationWindow:
 
     def _draw_preparation(self, width: int, height: int) -> None:
         lines = (
-            "1.  Warm up: about 30 minutes on.",
-            "2.  Light: your usual light; dim it for the shadow step.",
-            "3.  Monitor: dynamic contrast, eco mode and enhancements off; "
-            "Standard / sRGB / User preset.",
-            '4.  This PC: the "PC software" cards back to neutral (50; Hue angle 0).',
-            "5.  This window: on the monitor you are adjusting, full screen (F11).",
+            "1.  Monitor on for about 30 minutes.",
+            "2.  Your usual room light.",
+            "3.  On the monitor: dynamic contrast, eco and enhancements off; "
+            "Standard, sRGB or User preset.",
+            '4.  In monitorctl: every "PC" control at 50 (Hue angle 0).',
+            "5.  Drag this window onto the monitor you are adjusting, then F11.",
         )
         for index, line in enumerate(lines):
             self.canvas.create_text(
@@ -452,33 +465,39 @@ class CalibrationWindow:
             self._text(width * (left + 0.19), height * 0.93, name, background)
 
     def _draw_gamma(self, width: int, height: int) -> None:
+        """One-pixel black and white stripes around one solid grey, large.
+
+        One square to judge rather than a row of candidates: "does it vanish,
+        or is it darker or lighter" is a question anyone can answer, and
+        Gamma (software) moves the square while the stripes - pure black and
+        white, which a gamma curve never moves - stay put.
+        """
         background = self.step.background
-        top, bottom = height * 0.15, height * 0.75
-        cell = width / (len(GAMMA_SOLIDS) * 2 + 1)
-        for index, level in enumerate(GAMMA_SOLIDS):
-            left = cell * (1 + index * 2)
-            # One-pixel black and white lines, then the solid grey inside them.
-            self.canvas.create_rectangle(
-                left, top, left + cell, bottom, fill="#000000", width=0
-            )
-            for y in range(int(top), int(bottom), 2):
-                self.canvas.create_line(left, y, left + cell, y, fill="#ffffff")
-            inset = cell * 0.3
-            self.canvas.create_rectangle(
-                left + inset,
-                top + (bottom - top) * 0.3,
-                left + cell - inset,
-                bottom - (bottom - top) * 0.3,
-                fill=_grey(level),
-                width=0,
-            )
-            # Lines average half the light: the grey that matches them shows
-            # gamma = log(0.5) / log(level / 255).
-            gamma = math.log(0.5) / math.log(level / 255)
-            label = f"{level}  ·  {gamma:.1f}"
-            if level == GAMMA_TARGET:
-                label += "  (standard)"
-            self._text(left + cell / 2, bottom + 18, label, background)
+        side = min(width * 0.6, height * 0.72)
+        left, top = (width - side) / 2, (height - side) / 2 - 10
+        self.canvas.create_rectangle(
+            left, top, left + side, top + side, fill="#000000", width=0
+        )
+        for y in range(int(top), int(top + side), 2):
+            self.canvas.create_line(left, y, left + side, y, fill="#ffffff")
+        inset = side / 3
+        self.canvas.create_rectangle(
+            left + inset,
+            top + inset,
+            left + side - inset,
+            top + side - inset,
+            fill=_grey(GAMMA_TARGET),
+            width=0,
+        )
+        # Lines average half the light: the grey that matches them shows
+        # gamma = log(0.5) / log(level / 255).
+        gamma = math.log(0.5) / math.log(GAMMA_TARGET / 255)
+        self._text(
+            width / 2,
+            top + side + 18,
+            f"Vanishes = gamma {gamma:.1f}, the standard",
+            background,
+        )
 
     def _draw_gradients(self, width: int, height: int) -> None:
         # 256 levels exist; more rectangles would only repeat them.

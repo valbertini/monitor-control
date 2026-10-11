@@ -12,6 +12,14 @@ place for a tray application, and the right one here:
 The Run key cannot delay a start.  It does not need to: the app shows its icon
 at once and waits on its own before touching the monitors (``app/tray.py``).
 
+**Task Manager's switch.**  Turning the app off in *Startup apps* does not
+touch the Run value: Explorer records it beside it, under ``StartupApproved``
+(an undocumented ``REG_BINARY`` whose first byte is odd when switched off), and
+then skips the value at logon.  So "enabled" means the Run value exists *and*
+that switch is not off; and enabling from the app - an explicit request - also
+clears the switch, or it would stay a silent no-op (D32).  A Run value with no
+switch entry at all starts, which is how every new value begins.
+
 **Portability.**  The value holds an absolute path.  When the portable folder
 is moved, the old value points nowhere; the app notices on its next start and
 rewrites it (:func:`repair`).
@@ -31,6 +39,7 @@ from pathlib import Path
 from typing import Protocol
 
 __all__ = [
+    "APPROVAL_KEY",
     "APP_EXECUTABLE",
     "LEGACY_TASK_NAME",
     "RUN_KEY",
@@ -50,6 +59,8 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+#: Where Task Manager's *Startup apps* switch lives, one value per Run value.
+APPROVAL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 VALUE_NAME = "monitorctl"
 LEGACY_TASK_NAME = "monitorctl-restore"
 
@@ -65,11 +76,13 @@ class AutostartError(Exception):
 
 
 class RunKey(Protocol):
-    """The three operations needed on the Run key; replaceable in tests."""
+    """The operations needed on the Run key and its switch; replaceable in tests."""
 
     def get(self, name: str) -> str | None: ...
     def set(self, name: str, command: str) -> None: ...
     def delete(self, name: str) -> None: ...
+    def switched_off(self, name: str) -> bool: ...
+    def clear_switch(self, name: str) -> None: ...
 
 
 class RegistryRunKey:
@@ -111,6 +124,31 @@ class RegistryRunKey:
         except OSError as exc:
             raise AutostartError(f"could not write the Run key: {exc}") from exc
 
+    def switched_off(self, name: str) -> bool:
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVAL_KEY) as key:
+                value, kind = winreg.QueryValueEx(key, name)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise AutostartError(f"could not read the startup switch: {exc}") from exc
+        return kind == winreg.REG_BINARY and bool(value) and bool(value[0] & 1)
+
+    def clear_switch(self, name: str) -> None:
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, APPROVAL_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AutostartError(f"could not write the startup switch: {exc}") from exc
+
 
 def _default_key() -> RunKey:
     return RegistryRunKey()
@@ -137,29 +175,46 @@ def launch_command() -> str:
 
 
 def is_enabled(key: RunKey | None = None) -> bool:
-    """Whether *some* monitorctl is set to start with Windows."""
-    return (key or _default_key()).get(VALUE_NAME) is not None
+    """Whether *some* monitorctl will start with Windows.
+
+    The Run value alone is not enough: switched off in Task Manager, it is
+    still there and Windows skips it.
+    """
+    key = key or _default_key()
+    return key.get(VALUE_NAME) is not None and not key.switched_off(VALUE_NAME)
 
 
 def enable(key: RunKey | None = None) -> str:
     """Start this installation with Windows; returns the command registered.
 
+    Also turns Task Manager's switch back on: the user asked for the start
+    here, and a value Windows skips would only look enabled.
+
     Raises:
         AutostartError: If the registry refused the write.
     """
+    key = key or _default_key()
     command = launch_command()
-    (key or _default_key()).set(VALUE_NAME, command)
+    key.set(VALUE_NAME, command)
+    if key.switched_off(VALUE_NAME):
+        key.clear_switch(VALUE_NAME)
+        _log.info("start with Windows was switched off in Task Manager; switched on")
     _log.info("start with Windows enabled: %s", command)
     remove_legacy_task()
     return command
 
 
 def disable(key: RunKey | None = None) -> bool:
-    """Stop starting with Windows.  Returns ``False`` if it was not enabled."""
+    """Stop starting with Windows.  Returns ``False`` if it was not enabled.
+
+    Removes the Run value and Task Manager's switch for it, so nothing is
+    left behind.
+    """
     key = key or _default_key()
     if key.get(VALUE_NAME) is None:
         return False
     key.delete(VALUE_NAME)
+    key.clear_switch(VALUE_NAME)
     _log.info("start with Windows disabled")
     return True
 

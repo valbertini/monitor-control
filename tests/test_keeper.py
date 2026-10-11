@@ -304,6 +304,77 @@ class TestWhenTheKeeperStaysOut(KeeperTestCase):
         self.assertEqual(self.tcl.writes, [])
 
 
+class TestWhatWasHeldIsPaidAfterwards(KeeperTestCase):
+    """Held off is not blind: what happened meanwhile is put back once free."""
+
+    def test_an_event_while_editing_is_pushed_when_the_edit_ends(self) -> None:
+        """The case found in review: the TCL power-cycled while the window
+        showed unsaved changes, and nothing ever pushed its gains again."""
+        self.suspended = True
+        self.keeper.handle_event(Event.DISPLAY_ON)
+        self.assertEqual(self.tcl.writes, [])
+        self.assertEqual(self.keeper.owed, Event.DISPLAY_ON.value)
+
+        self.assertIsNone(self.keeper.catch_up())  # still editing
+        self.suspended = False
+        result = self.keeper.catch_up()
+
+        self.assertIn(Event.DISPLAY_ON.value, result.reason)
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 60)])
+        self.assertEqual(self.steady.writes, [])
+        self.assertIsNone(self.keeper.owed)
+
+    def test_a_power_cycle_seen_while_editing_is_owed(self) -> None:
+        """Detect mode keeps reading while the window holds the keeper."""
+        self.suspended = True
+        self.tcl.gone = True
+        self.keeper.tick()
+        self.tcl.gone = False
+        self.keeper.tick()
+        self.assertEqual(self.tcl.writes, [])
+        self.assertIn("came back", self.keeper.owed)
+
+        self.suspended = False
+        self.keeper.catch_up()
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 60)])
+
+    def test_unpausing_pushes_everything_once(self) -> None:
+        """Paused, nothing is watched: what the monitors went through is
+        unknown, so the first moment back pays for all of it."""
+        self.settings = AppSettings(paused=True)
+        self.keeper.tick()
+        self.settings = AppSettings()
+        self.keeper.catch_up()
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 60)])
+        self.clear_traffic()
+        self.assertIsNone(self.keeper.catch_up())
+        self.keeper.tick()
+        self.assertEqual(self.tcl.writes, [])
+
+    def test_the_next_check_pays_it_too(self) -> None:
+        self.suspended = True
+        self.keeper.handle_event(Event.RESUMED)
+        self.suspended = False
+        self.keeper.tick()
+        self.assertEqual(self.tcl.writes, [(0x16, 50), (0x16, 60)])
+
+    def test_nothing_is_owed_without_a_reason(self) -> None:
+        self.suspended = True
+        self.keeper.tick()
+        self.suspended = False
+        self.assertIsNone(self.keeper.catch_up())
+        self.assertEqual(self.tcl.writes, [])
+
+    def test_a_monitor_still_off_is_left_to_the_checks(self) -> None:
+        self.suspended = True
+        self.keeper.handle_event(Event.DISPLAY_CHANGED)
+        self.suspended = False
+        self.tcl.gone = True
+        self.keeper.catch_up()
+        self.assertEqual(self.tcl.writes, [])
+        self.assertEqual(self.keeper.lost, {TCL.hardware_id})
+
+
 class TestEvents(KeeperTestCase):
     def test_an_event_rescans_and_pushes_through_the_pivot(self) -> None:
         result = self.keeper.handle_event(Event.MONITOR_ARRIVED)

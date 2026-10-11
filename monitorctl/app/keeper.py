@@ -23,8 +23,15 @@ written (``MonitorService.reassert_saved``).  A monitor that keeps its settings
 gets no writes from the keeper at all, so a one-minute timer cannot become an
 EEPROM-wear loop.
 
+**Held off.**  Paused, or while the user edits in the window, nothing is
+written - but what happens meanwhile is not forgotten: an event, a monitor
+seen coming back (detect mode keeps reading while the window holds it), or
+the pause itself leaves a re-apply *owed*, paid with one full push as soon as
+the keeper is free (:meth:`Keeper.catch_up`).
+
 Nothing in here sleeps, spawns threads or touches a window: the worker thread
-calls :meth:`Keeper.tick` and :meth:`Keeper.handle_event`, and the tests call
+calls :meth:`Keeper.tick`, :meth:`Keeper.handle_event` and
+:meth:`Keeper.catch_up`, and the tests call
 them directly.
 """
 
@@ -111,6 +118,10 @@ class Keeper:
         #: EDID identities shared by more than one connected monitor.
         self._ambiguous: frozenset[str] = frozenset()
         self._last_rescan = clock()
+        #: Why a re-apply is owed: something that may have cost a monitor its
+        #: settings happened while the keeper could not write.  Paid with one
+        #: full push as soon as it can (:meth:`catch_up`).
+        self._owed: str | None = None
 
     def _identity(self, state: MonitorState) -> str:
         """What a forgetful monitor is known by across enumerations.
@@ -133,10 +144,51 @@ class Keeper:
         """Monitors that stopped answering and have not come back yet."""
         return frozenset(self._lost)
 
+    @property
+    def owed(self) -> str | None:
+        """Why a full re-apply waits for the keeper to be free; ``None`` if none."""
+        return self._owed
+
+    def _owe(self, reason: str) -> None:
+        if self._owed is None:
+            _log.info(
+                "%s while automatic writes were held; re-applying afterwards", reason
+            )
+            self._owed = reason
+
     def _idle(self) -> bool:
-        if self._settings().paused or self._suspended():
+        if self._service.saved_snapshot() is None:
+            return True  # nothing to put back, so nothing is ever owed either
+        if self._settings().paused:
+            # Checks skipped, events ignored: nothing tells what the monitors
+            # went through meanwhile.  Unpausing pays for it with one push.
+            self._owe("paused")
             return True
-        return self._service.saved_snapshot() is None
+        return self._suspended()
+
+    # ------------------------------------------------------------------ #
+    # Catching up
+    # ------------------------------------------------------------------ #
+
+    def catch_up(self) -> KeeperResult | None:
+        """Pay a re-apply owed since a pause or an edit, if the keeper is free.
+
+        "Everything", as an event would: every forgetful monitor that answers
+        gets its controls through the pivot, and every GPU adjustment is put
+        back.  A forgetful monitor that does not answer is marked lost, and
+        pushed by the checks when it does.
+        """
+        if self._owed is None or self._idle():
+            return None
+        reason, self._owed = self._owed, None
+        states = self._service.list_monitors(probe=False)
+        self._note_ambiguous(states)
+        silent = {self._identity(s) for s in states if s.volatile and not self._ping(s)}
+        self._lost |= silent
+        targets = [s.id for s in states if self._identity(s) not in silent]
+        if not targets:
+            return None
+        return self._push(Reassert.PIVOT, targets, reason=f"{reason}, held until now")
 
     # ------------------------------------------------------------------ #
     # Periodic check
@@ -145,7 +197,19 @@ class Keeper:
     def tick(self) -> KeeperResult | None:
         """Run one periodic check.  Returns ``None`` when nothing was written."""
         if self._idle():
+            settings = self._settings()
+            if (
+                self._suspended()
+                and not settings.paused
+                and settings.mode is RefreshMode.DETECT
+                and self._service.saved_snapshot() is not None
+            ):
+                # Held off by the window, not paused: still watch (reads
+                # only), so a power cycle meanwhile is owed, not missed.
+                self._watch_while_held()
             return None
+        if self._owed is not None:
+            return self.catch_up()
         monitors = self._service.list_monitors(probe=False)
         self._note_ambiguous(monitors)
         watched = [s for s in monitors if s.volatile]
@@ -209,6 +273,28 @@ class Keeper:
         )
         return KeeperResult(result.reason, result.report, rescanned=rescanned)
 
+    def _watch_while_held(self) -> None:
+        """Detection without the push: a monitor back from a power cycle is
+        noted as owed, since nothing may be written while the user edits.
+
+        No rescan here - it would redraw the window under the user; a dead
+        handle waits for the checks that follow the edit.
+        """
+        monitors = self._service.list_monitors(probe=False)
+        self._note_ambiguous(monitors)
+        for state in monitors:
+            if not state.volatile:
+                continue
+            key = self._identity(state)
+            self._known.add(key)
+            if self._ping(state):
+                if key in self._lost:
+                    self._lost.discard(key)
+                    self._owe(f"{state.name} came back on")
+            elif key not in self._lost:
+                _log.info("%s stopped answering; watching for its return", state.name)
+                self._lost.add(key)
+
     def _ping(self, state: MonitorState) -> bool:
         try:
             return self._service.ping(state.id)
@@ -249,7 +335,12 @@ class Keeper:
         gone = self._known - present
         if self._idle():
             self._lost = gone | (self._lost & present)
+            if self._service.saved_snapshot() is not None:
+                # Held off (paused, or the user editing): whatever the event
+                # cost the monitors is put back once the keeper is free.
+                self._owe(event.value)
             return KeeperResult(event.value, None, rescanned=True)
+        self._owed = None  # what follows is the same full push
         silent = {self._identity(s) for s in states if s.volatile and not self._ping(s)}
         for state in states:
             if (

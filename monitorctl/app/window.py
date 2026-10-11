@@ -40,7 +40,7 @@ from ..ddc.service import (
     WriteOutcome,
 )
 from ..ddc.snapshot import Snapshot
-from ..ddc.vcp import CATEGORIES, FEATURES
+from ..ddc.vcp import CATEGORIES, FEATURES, inert_keys
 from ..fileio import state_directory
 from . import win32
 from .calibration import CalibrationWindow
@@ -76,6 +76,9 @@ DOT = "\u25cf"
 REVERT_GLYPH = "\u21ba"
 #: Width a card column needs; the number of columns follows the window.
 COLUMN_WIDTH = 330
+#: How often the busy spinner turns, and by how many degrees.
+SPIN_MS = 80
+SPIN_STEP = 30
 
 
 class Bridge(Protocol):
@@ -165,6 +168,72 @@ class Tooltip:
             self._tip = None
 
 
+class Spinner:
+    """A small turning arc that says "working" where the work is reported.
+
+    In place of a busy pointer: a "watch" cursor over the whole window reads
+    as a hang, and holds nothing back anyway - every control already refuses
+    what cannot run while the bus is busy, and says so.
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        size: int,
+        background: Callable[[], str],
+        colour: Callable[[], str],
+    ) -> None:
+        """
+        Args:
+            master: Where it goes; the caller places :attr:`canvas`.
+            size: Width and height, in pixels.
+            background: The colour behind it, read on every :meth:`recolour`.
+            colour: The arc's colour, likewise.
+        """
+        self.canvas = tk.Canvas(
+            master, width=size, height=size, highlightthickness=0, borderwidth=0
+        )
+        inset = 2
+        self._arc = self.canvas.create_arc(
+            inset,
+            inset,
+            size - inset,
+            size - inset,
+            start=90,
+            extent=270,
+            style="arc",
+            width=2,
+        )
+        self._background = background
+        self._colour = colour
+        self._angle = 90
+        self._after: str | None = None
+        self.recolour()
+
+    @property
+    def turning(self) -> bool:
+        return self._after is not None
+
+    def start(self) -> None:
+        if self._after is None:
+            self._turn()
+
+    def stop(self) -> None:
+        if self._after is not None:
+            self.canvas.after_cancel(self._after)
+            self._after = None
+
+    def recolour(self) -> None:
+        self.canvas.configure(background=self._background())
+        self.canvas.itemconfigure(self._arc, outline=self._colour())
+
+    def _turn(self) -> None:
+        self._angle = (self._angle - SPIN_STEP) % 360
+        self.canvas.itemconfigure(self._arc, start=self._angle)
+        self._after = self.canvas.after(SPIN_MS, self._turn)
+
+
 #: Widget classes whose stock bindings change their value on a wheel turn.
 WHEEL_CLASSES = ("TSpinbox", "TCombobox")
 
@@ -230,6 +299,11 @@ class FeatureRow:
     window: MainWindow
     monitor_id: str
     feature: FeatureState
+    #: The monitor as the window files it (:meth:`MainWindow._ident`): its
+    #: EDID identity, which a renumbering leaves alone.  ``monitor_id`` is a
+    #: position, right only until the next re-enumeration; whatever comes
+    #: back to a row later finds the monitor by this.
+    ident: str = ""
     confirmed: int | None = None
     in_flight: bool = False
     pending: int | None = None
@@ -353,7 +427,7 @@ class FeatureRow:
         )
         Tooltip(self.revert, self._revert_tip, lambda: self.window.palette)
         self.refresh_drift()
-        staged = self.window.staged_value(self.monitor_id, self.key)
+        staged = self._staged()
         if staged is not None:
             # Redrawn while a change waits for Apply: still show that change.
             self.show(staged)
@@ -383,10 +457,13 @@ class FeatureRow:
         current = self.window.values.get((self.monitor_id, self.key))
         return saved is not None and current is not None and saved != current
 
+    def _staged(self) -> int | None:
+        return self.window.staged.get((self.ident, self.key))
+
     @property
     def waiting(self) -> bool:
         """A change to this control waits for Apply."""
-        return self.window.staged_value(self.monitor_id, self.key) is not None
+        return self._staged() is not None
 
     def refresh_drift(self) -> None:
         """Offer the mark while there is something to go back from: a change
@@ -414,9 +491,7 @@ class FeatureRow:
             return
         # A drag still waiting for its debounce would otherwise land after
         # this and undo it.
-        if self.debounce is not None:
-            self.window.root.after_cancel(self.debounce)
-            self.debounce = None
+        self.cancel_debounce()
         if self.waiting:
             self.window.unstage(self)
             return
@@ -501,17 +576,52 @@ class FeatureRow:
         # On the root, not on the row's own widget: a reload that redraws the
         # rows meanwhile must not drop the write the user just made.
         self.debounce = self.window.root.after(delay, lambda: self._commit(value))
+        # Known to the window, which may have to send it at once (Save) or
+        # drop it (Restore) instead of waiting for the delay.
+        self.window.settling[self] = value
+
+    def cancel_debounce(self) -> None:
+        """Drop a change still waiting for the value to settle."""
+        if self.debounce is not None:
+            self.window.root.after_cancel(self.debounce)
+            self.debounce = None
+        self.window.settling.pop(self, None)
+
+    def flush(self) -> None:
+        """Commit now what would be committed when the value settles."""
+        value = self.window.settling.get(self)
+        self.cancel_debounce()
+        if self.typed:
+            # Typed into the field and not committed yet - Ctrl+S with the
+            # focus still there: that number is what the user sees.
+            self._on_text_commit()
+            value = self.window.settling.get(self, value)
+            self.cancel_debounce()
+        if value is not None:
+            self._commit(value)
 
     # Writing ---------------------------------------------------------------- #
 
     def _commit(self, value: int) -> None:
         self.debounce = None
+        self.window.settling.pop(self, None)
+        live = self.window.live_row(self.ident, self.key)
+        if live is not self and (not self.in_flight or not self.window.auto_apply):
+            # Redrawn since the change was made (a debounce or a focus-out
+            # firing after a reload): this row's widgets are gone, so the row
+            # on screen takes the change - or nothing does, if the control is
+            # no longer shown.  A write still in flight from here keeps its
+            # order through ``pending`` and comes back once it lands.
+            if live is not None:
+                live.show(value)
+                live._commit(value)
+            return
         if not self.window.auto_apply:
             self.window.stage(self, value)
             return
         if self.waiting:
             # Written now, so nothing about it waits any more.
-            self.window.staged.pop((self.window._ident(self.monitor_id), self.key), None)
+            self.window.staged.pop((self.ident, self.key), None)
             self.mark_staged(False)
         if self.window.busy:
             self.window.status(
@@ -523,16 +633,22 @@ class FeatureRow:
             self.pending = value
             return
         self.in_flight = True
-        monitor_id, key = self.monitor_id, self.key
+        self.window.writing.add(self)
+        self.window._refresh_state()  # holds the keeper off (see there)
+        key = self.key
+        # Found again inside the job: a keeper rescan queued ahead of it may
+        # have renumbered the monitors, and this position be another's now.
+        locate = self.window.locator(self.monitor_id)
         self.window.bridge.worker.submit(
-            lambda s: s.write_feature(monitor_id, key, value),
+            lambda s: s.write_feature(locate(s), key, value),
             self._written,
             label=f"Writing {self.feature.label}",
         )
 
     def _written(self, outcome: WriteOutcome | None, error: BaseException | None) -> None:
         self.in_flight = False
-        live = self.window.rows.get((self.monitor_id, self.key))
+        self.window.writing.discard(self)
+        live = self.window.live_row(self.ident, self.key)
         if live is not None and live is not self:
             # The window was redrawn while this write was in flight; the row on
             # screen now is another object, built from the value before it.
@@ -541,11 +657,15 @@ class FeatureRow:
             self.window.status(f"{self.feature.label}: {error}", error=True)
             self.pending = None
             self.show(self.confirmed)
+            self.window._refresh_state()  # nothing in flight to wait for
         else:
             self.confirmed = (
                 outcome.confirmed if outcome.confirmed is not None else outcome.applied
             )
-            self.window.record(self.monitor_id, self.key, self.confirmed)
+            # Under the monitor's id *now*, which a redraw may have changed.
+            monitor_id = self.window._monitor_id_of(self.ident)
+            if monitor_id is not None:
+                self.window.record(monitor_id, self.key, self.confirmed)
             if outcome.warnings:
                 self.window.status(f"{self.feature.label}: {outcome.warnings[-1]}")
             if self.pending is None:
@@ -554,6 +674,7 @@ class FeatureRow:
             value, self.pending = self.pending, None
             if value != self.confirmed:
                 self._commit(value)
+        self.window.edits_landed()
 
     def confirm(self, outcome: WriteOutcome | None, error: BaseException | None) -> None:
         """Take over the result of a write made through a row since destroyed."""
@@ -566,7 +687,7 @@ class FeatureRow:
 
     def _on_screen(self) -> int | None:
         """What the control should display: a waiting change, else the monitor."""
-        staged = self.window.staged_value(self.monitor_id, self.key)
+        staged = self._staged()
         return self.confirmed if staged is None else staged
 
     def show(self, value: int | None) -> None:
@@ -840,9 +961,19 @@ class MainWindow:
         self.values: dict[tuple[str, str], int | None] = {}
         self.rows: dict[tuple[str, str], FeatureRow] = {}
         self.profile_bars: dict[str, ProfileBar] = {}
-        #: Changes made with auto apply off, by (monitor id, feature key),
-        #: waiting for Apply.  Kept across redraws.
+        #: Changes made with auto apply off, by (monitor identity, feature
+        #: key), waiting for Apply.  Kept across redraws.
         self.staged: dict[tuple[str, str], int] = {}
+        #: Rows whose change waits for the value to settle (the debounce), with
+        #: that value; and rows whose write is on its way.  Rows a redraw
+        #: replaced included: their changes are the user's all the same.
+        self.settling: dict[FeatureRow, int] = {}
+        self.writing: set[FeatureRow] = set()
+        #: What runs once every change made has landed (see ``_after_edits``),
+        #: by name, so asking twice does not run it twice.
+        self._after_edits_land: dict[str, Callable[[], None]] = {}
+        #: An operation asked for while another ran, run when it ends.
+        self._deferred: Callable[[], None] | None = None
         #: Asks for a profile name; replaceable, since a modal dialog cannot
         #: be answered from a test.
         self.ask_name = ask_name
@@ -891,7 +1022,7 @@ class MainWindow:
             command=self._toggle_auto_apply,
         )
         auto.pack(side="left")
-        self.apply_button = ttk.Button(toolbar, text="Apply", command=self.apply_staged)
+        self.apply_button = ttk.Button(toolbar, text="Apply", command=self.apply)
         self.apply_button.pack(side="left", padx=(8, 0))
         self.discard_button = ttk.Button(
             toolbar, text="Discard", style="Link.TButton", command=self.discard_staged
@@ -932,13 +1063,25 @@ class MainWindow:
                 "On: every change goes to the monitor at once. Off: changes wait "
                 "until Apply, so several can be set and judged together",
             ),
-            (self.apply_button, "Write the changes waiting in the window"),
+            (
+                self.apply_button,
+                "Write the changes waiting in the window. With none waiting, send "
+                "what the window shows again to the controls a monitor forgets - "
+                "after it was switched off, for instance",
+            ),
             (self.discard_button, "Forget the changes waiting in the window"),
         ):
             Tooltip(button, text, lambda: self.palette)
 
         status = ttk.Frame(self.root, style="Status.TFrame", padding=(12, 4))
         status.pack(side="bottom", fill="x")
+        # Beside the message that says what is being done; shown while busy.
+        self.spinner = Spinner(
+            status,
+            size=14,
+            background=lambda: self.palette.surface,
+            colour=lambda: self.palette.accent,
+        )
         self.status_label = ttk.Label(status, style="Status.TLabel")
         self.status_label.pack(side="left")
         self.keeper_label = ttk.Label(status, style="Status.TLabel")
@@ -947,9 +1090,21 @@ class MainWindow:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side="top", fill="both", expand=True, padx=8, pady=(6, 8))
         self.notebook.enable_traversal()
-        self.placeholder = ttk.Label(
-            self.notebook, text="Reading monitors…", style="Dim.TLabel", anchor="center"
+        # Stands for the monitor tabs until there are any: while the first
+        # read runs, with a spinner where the monitors will appear.
+        self.placeholder = ttk.Frame(self.notebook)
+        centre = ttk.Frame(self.placeholder)
+        centre.place(relx=0.5, rely=0.5, anchor="center")
+        self.placeholder_spinner = Spinner(
+            centre,
+            size=28,
+            background=lambda: self.palette.bg,
+            colour=lambda: self.palette.accent,
         )
+        self.placeholder_label = ttk.Label(
+            centre, text="Reading monitors…", style="Dim.TLabel", justify="center"
+        )
+        self.placeholder_label.pack(side="bottom")
         self.notebook.add(self.placeholder, text="Monitors")
         self.settings_tab = self._build_settings()
         self.notebook.add(self.settings_tab, text="Settings")
@@ -1093,7 +1248,15 @@ class MainWindow:
         control.  ``proceed`` runs once they are settled, or at once if there
         are none.
         """
-        if self.root.state() == "withdrawn" or not (self.drifted() or self.staged):
+        hidden = self.root.state() == "withdrawn"
+        # Busy, a change sent now would be refused; _settle_then says to wait.
+        if (
+            not hidden
+            and not self.busy
+            and self._after_edits("exit", lambda: self.confirm_exit(proceed))
+        ):
+            return
+        if hidden or not (self.drifted() or self.staged):
             proceed()
             return
         # Brought forward without show(): that may start a reload, and a busy
@@ -1106,6 +1269,10 @@ class MainWindow:
     def _settle_then(self, then: Callable[[], None], *, cancel: str) -> None:
         if self.busy:
             self.status("Wait for the current operation to finish.")
+            return
+        # A drag let go a moment ago is not in the values yet: without this,
+        # closing within the debounce would ask nothing about it.
+        if self._after_edits("close", lambda: self._settle_then(then, cancel=cancel)):
             return
         if self.staged:
             # Changes not written yet come first: they decide what "unsaved"
@@ -1221,7 +1388,7 @@ class MainWindow:
         self.values = {(m.id, f.key): f.value for m in self.monitors for f in m.features}
 
         if not self.monitors:
-            self.placeholder.configure(
+            self.placeholder_label.configure(
                 text="No DDC/CI-capable monitor was found.\n"
                 "Check that DDC/CI is enabled in the monitor's own menu, then press Rescan."
             )
@@ -1382,8 +1549,9 @@ class MainWindow:
                 add="+",
             )
         card.columnconfigure(2, weight=1)
+        ident = self._ident(monitor.id)
         for index, feature in enumerate(members, start=1):
-            row = FeatureRow(self, monitor.id, feature)
+            row = FeatureRow(self, monitor.id, feature, ident=ident)
             row.build(card, index)
             self.rows[(monitor.id, feature.key)] = row
         return card
@@ -1454,10 +1622,19 @@ class MainWindow:
         self._refresh_state()
 
     def saved_value(self, monitor_id: str, key: str) -> int | None:
-        """The value of ``key`` in the monitor's profile in use, if any."""
+        """The value of ``key`` in the monitor's profile in use, if any.
+
+        ``None`` for a control inert on the monitor's input: its reading is
+        noise, so it is never compared with the profile (D32).
+        """
+        if key in self._inert(monitor_id):
+            return None
         entry = self.profiles.get(monitor_id)
         active = entry.active_profile if entry else None
         return None if active is None else active.values.get(key)
+
+    def _inert(self, monitor_id: str) -> frozenset[str]:
+        return inert_keys(self.values.get((monitor_id, "input_source")))
 
     def has_saved(self) -> bool:
         """Whether any connected monitor has a profile in use."""
@@ -1477,7 +1654,10 @@ class MainWindow:
             active = entry.active_profile if entry else None
             if active is None:
                 continue
+            inert = self._inert(monitor.id)
             for key, value in active.values.items():
+                if key in inert:
+                    continue
                 current = self.values.get((monitor.id, key))
                 if current is not None and current != value:
                     feature = monitor.feature(key)
@@ -1503,6 +1683,12 @@ class MainWindow:
 
     def save(self, *, then: Callable[[], None] | None = None) -> None:
         if self.busy:
+            self._when_free(lambda: self.save(then=then), "Save")
+            return
+        # What is saved is what the window shows, the last drag included:
+        # its write is sent now instead of after the debounce, and the save
+        # waits for it.
+        if self._after_edits("save", lambda: self.save(then=then)):
             return
         if self.staged:
             # Save keeps what is on screen, so what waits is applied first.
@@ -1540,9 +1726,14 @@ class MainWindow:
 
     def restore(self, *, then: Callable[[], None] | None = None) -> None:
         if self.busy:
+            self._when_free(lambda: self.restore(then=then), "Restore")
             return
         if not self.has_saved():
             self.status("Nothing has been saved yet.", error=True)
+            return
+        # A drag still settling would land after the restore and undo it:
+        # dropped, and a write already on its way is waited for.
+        if self._after_edits("restore", lambda: self.restore(then=then), keep=False):
             return
         # The saved values replace whatever was waiting.
         self.discard_staged()
@@ -1596,6 +1787,83 @@ class MainWindow:
     def _monitor_id_of(self, ident: str) -> str | None:
         return next((m.id for m in self.monitors if self._ident(m.id) == ident), None)
 
+    def live_row(self, ident: str, key: str) -> FeatureRow | None:
+        """The row on screen for a control of the monitor filed as ``ident``."""
+        monitor_id = self._monitor_id_of(ident)
+        return None if monitor_id is None else self.rows.get((monitor_id, key))
+
+    def locator(self, monitor_id: str) -> Callable[[MonitorService], str]:
+        """How a job finds, on the bus thread, the monitor the user acted on.
+
+        A job waits in the queue behind whatever is there - a keeper rescan
+        among them, after which Windows may have handed this position to the
+        other monitor.  The job finds the monitor again by its EDID identity
+        when it runs (:meth:`MonitorService.resolve`), and fails rather than
+        write the wrong one if it is gone.
+        """
+        monitor = next((m for m in self.monitors if m.id == monitor_id), None)
+        hardware_id = monitor.hardware_id if monitor is not None else ""
+        return lambda service: service.resolve(hardware_id, monitor_id)
+
+    # Changes not landed yet ------------------------------------------------ #
+
+    def _edits_pending(self) -> bool:
+        return bool(
+            self.settling or self.writing or any(row.typed for row in self.rows.values())
+        )
+
+    def _after_edits(
+        self, name: str, action: Callable[[], None], *, keep: bool = True
+    ) -> bool:
+        """Make ``action`` wait for the changes the user made to land.
+
+        A change is not in the values until its write comes back: a drag
+        waits for the value to settle (``DEBOUNCE_MS``), then for the bus.
+        Save, closing and exiting act on the values, so they would miss a
+        change made a moment before.  With ``keep``, a change still settling
+        is sent now rather than after the delay - the user's own idea of it
+        was settled when they pressed Save; without it (Restore, which puts
+        other values over it) it is dropped.  A write already on its way is
+        waited for either way: the bus runs it before anything queued later,
+        but its result has to be drawn first.
+
+        Returns whether ``action`` was put off; it then runs, once, when the
+        last write lands (asking again under the same ``name`` replaces it).
+        """
+        if not self._edits_pending():
+            return False
+        for row in {*self.settling, *self.writing, *self.rows.values()}:
+            if keep:
+                row.flush()
+            else:
+                row.cancel_debounce()
+                row.typed = False
+                row.pending = None
+        if not self.writing:
+            # Nothing left on its way (staged, or dropped): go on at once.
+            return False
+        self._after_edits_land[name] = action
+        return True
+
+    def edits_landed(self) -> None:
+        """A write came back: run what waited for all of them."""
+        if self.writing or not self._after_edits_land:
+            return
+        waiting = list(self._after_edits_land.values())
+        self._after_edits_land.clear()
+        for action in waiting:
+            action()
+
+    def _when_free(self, action: Callable[[], None], what: str) -> None:
+        """Run ``action`` when the operation in progress ends.
+
+        For Save and Restore from the tray or the keyboard, which reach the
+        window while the toolbar's buttons are disabled: dropped silently,
+        the user would believe they had saved.
+        """
+        self._deferred = action
+        self.status(f"{what} will run when the current operation ends…", sticky=True)
+
     def staged_value(self, monitor_id: str, key: str) -> int | None:
         return self.staged.get((self._ident(monitor_id), key))
 
@@ -1621,7 +1889,7 @@ class MainWindow:
         screen is made to match it again, and while a write is still on its
         way, when the monitor's value is not known yet.
         """
-        key = (self._ident(row.monitor_id), row.key)
+        key = (row.ident, row.key)
         same = value == row.confirmed and not row.in_flight
         if same and row.key not in self.volatile(row.monitor_id):
             self.staged.pop(key, None)
@@ -1632,7 +1900,7 @@ class MainWindow:
 
     def unstage(self, row: FeatureRow) -> None:
         """Forget one control's waiting change; it shows the monitor's value."""
-        if self.staged.pop((self._ident(row.monitor_id), row.key), None) is not None:
+        if self.staged.pop((row.ident, row.key), None) is not None:
             row.mark_staged(False)
             row.show(row.confirmed)
             self._refresh_state()
@@ -1651,11 +1919,16 @@ class MainWindow:
         """
         if self.busy:
             return
+        # A drag let go a moment ago is part of what waits.
+        if self._after_edits(
+            "apply", lambda: self.apply_staged(monitor_id=monitor_id, then=then)
+        ):
+            return
         ident = None if monitor_id is None else self._ident(monitor_id)
         order = {key: index for index, key in enumerate(FEATURES)}
         items = sorted(
             (
-                (owner_id, key, value, (owner, key))
+                (self.locator(owner_id), key, value, owner)
                 for (owner, key), value in self.staged.items()
                 if (ident is None or owner == ident)
                 and (owner_id := self._monitor_id_of(owner)) is not None
@@ -1668,14 +1941,14 @@ class MainWindow:
             return
         self._set_busy(True, f"Applying {len(items)} change(s)…")
 
-        def run(service: MonitorService) -> list[tuple[str, str, tuple, object]]:
-            results: list[tuple[str, str, tuple, object]] = []
-            for target, key, value, filed in items:
+        def run(service: MonitorService) -> list[tuple[str, str, object]]:
+            results: list[tuple[str, str, object]] = []
+            for locate, key, value, owner in items:
                 try:
-                    outcome: object = service.write_feature(target, key, value)
+                    outcome: object = service.write_feature(locate(service), key, value)
                 except DdcError as exc:
                     outcome = exc
-                results.append((target, key, filed, outcome))
+                results.append((owner, key, outcome))
             return results
 
         def done(results: object, error: BaseException | None) -> None:
@@ -1684,19 +1957,23 @@ class MainWindow:
                 self.status(f"Could not apply: {error}", error=True)
                 return
             failed: list[str] = []
-            for target, key, filed, outcome in results:
+            for owner, key, outcome in results:
                 if isinstance(outcome, BaseException):
                     # Kept waiting, so it can be applied again or discarded.
                     failed.append(f"{key}: {outcome}")
                     continue
-                self.staged.pop(filed, None)
+                self.staged.pop((owner, key), None)
                 confirmed = (
                     outcome.confirmed
                     if outcome.confirmed is not None
                     else outcome.applied
                 )
-                self.values[(target, key)] = confirmed
-                row = self.rows.get((target, key))
+                # Under the monitor's id in the window's list, whatever the
+                # bus called it: the two may differ until the next reload.
+                target = self._monitor_id_of(owner)
+                if target is not None:
+                    self.values[(target, key)] = confirmed
+                row = self.live_row(owner, key)
                 if row is not None:
                     row.mark_staged(False)
                     row.confirm(outcome, None)
@@ -1726,9 +2003,58 @@ class MainWindow:
                 row.show(row.confirmed)
         self._refresh_state()
 
+    def apply(self) -> None:
+        """The Apply button: write what waits - or, with nothing waiting,
+        push what the window shows to the controls a monitor forgets."""
+        if self.busy:
+            return
+        if self._after_edits("apply", self.apply):
+            return
+        if self.staged:
+            self.apply_staged()
+        else:
+            self.push_current()
+
+    def push_current(self) -> None:
+        """Send what the window shows again to the controls a monitor forgets.
+
+        Nothing waits, yet the screen may not show what the window does: a
+        forgetful monitor (``ddc/quirks.py``) switched off and on where no
+        event reached the keeper, or while it was paused - and its read-back
+        cannot tell.  This is the user's way to make it so: the push Save
+        ends with, but of the values on screen, saved or not.  The controls
+        a monitor keeps are not written: their read-back is the truth, and
+        another write would only cost an EEPROM cycle.
+        """
+        if self.busy or not self.monitors:
+            return
+        self._set_busy(True, "Applying what the window shows…")
+
+        def run(service: MonitorService) -> RestoreReport:
+            return service.reassert_current(reassert=Reassert.PIVOT)
+
+        def done(report: object, error: BaseException | None) -> None:
+            self._set_busy(False)
+            if error is not None:
+                self.status(f"Could not apply: {error}", error=True)
+                return
+            if not report.applied and not report.failed:
+                self.status(
+                    "Nothing to apply: no change waits, and no monitor here forgets "
+                    "its settings.",
+                    ok=True,
+                )
+                return
+            message = f"Applied what the window shows: {len(report.applied)} written."
+            if report.failed:
+                message += f" {len(report.failed)} failed: {report.failed[0].reason}"
+            self.status(message, error=bool(report.failed), ok=not report.failed)
+
+        self.bridge.worker.submit(run, done, label="Applying")
+
     def _toggle_auto_apply(self) -> None:
         on = self.auto_apply_var.get()
-        if self.busy or any(row.in_flight for row in self.rows.values()):
+        if self.busy or self.writing:
             # Switching modes mid-write would leave a change neither applied
             # nor waiting.
             self.auto_apply_var.set(not on)
@@ -1746,7 +2072,12 @@ class MainWindow:
         active = entry.active_profile if entry else None
         if active is None:
             return
+        # As the service's profile switch: nothing inert on the current input
+        # is written, so nothing inert waits for Apply either (D32).
+        inert = self._inert(monitor_id)
         for key, value in active.values.items():
+            if key in inert:
+                continue
             row = self.rows.get((monitor_id, key))
             if row is None or row.revert is None:  # absent or read-only
                 continue
@@ -1787,6 +2118,9 @@ class MainWindow:
             if bar is not None:
                 bar.refresh()
             return
+        # The question below is about every change made, the last drag too.
+        if self._after_edits("switch", lambda: self.switch_profile(monitor_id, name)):
+            return
         monitor = self._monitor(monitor_id)
         entry = self.profiles.get(monitor_id)
         current = entry.active_profile if entry else None
@@ -1819,6 +2153,8 @@ class MainWindow:
     def _switch(self, monitor_id: str, name: str, *, save_first: bool) -> None:
         monitor = self._monitor(monitor_id)
         apply_now = self.auto_apply
+        ident = self._ident(monitor_id)
+        locate = self.locator(monitor_id)
         self._set_busy(True, f"Switching {monitor.name} to “{name}”…")
 
         def run(
@@ -1828,33 +2164,36 @@ class MainWindow:
             tuple[MonitorState, ...],
             dict[str, MonitorProfiles | None],
         ]:
+            target = locate(service)
             if save_first:
-                service.save_snapshot(monitor_ids=[monitor_id])
+                service.save_snapshot(monitor_ids=[target])
             report = None
             if apply_now:
-                report = service.activate_profile(
-                    monitor_id, name, reassert=Reassert.PIVOT
-                )
+                report = service.activate_profile(target, name, reassert=Reassert.PIVOT)
             else:
                 # Nothing is written until Apply - but what waits is decided
                 # against the monitor, not the cache, as a restore would.
-                service.select_profile(monitor_id, name)
-                service.reread(monitor_id)
+                service.select_profile(target, name)
+                service.reread(target)
             return report, service.list_monitors(), service.profiles_by_monitor()
 
         def done(result: object, error: BaseException | None) -> None:
             self._set_busy(False)
             if error is not None:
                 self.status(f"Could not switch profile: {error}", error=True)
-                self._refresh_after_failure(monitor_id)
+                self._refresh_after_failure(ident)
                 return
             report, self.monitors, self.profiles = result
             if report is None:
                 self.render()
-                self._stage_profile(monitor_id)
+                # The list just drawn is the bus's: the id may be new.
+                current = self._monitor_id_of(ident)
+                if current is not None:
+                    self._stage_profile(current)
                 self.status(
                     f"{monitor.name} now uses “{name}”: "
-                    f"{self.staged_count(monitor_id)} change(s) waiting for Apply."
+                    f"{self.staged_count(current) if current else 0} change(s) "
+                    "waiting for Apply."
                 )
                 return
             self.render()
@@ -1896,22 +2235,23 @@ class MainWindow:
 
     def _create_profile(self, monitor_id: str, name: str) -> None:
         monitor = self._monitor(monitor_id)
+        ident = self._ident(monitor_id)
+        locate = self.locator(monitor_id)
         self._set_busy(True, f"Saving “{name}”…")
 
         def run(service: MonitorService) -> tuple[RestoreReport, dict]:
-            service.create_profile(monitor_id, name)
+            target = locate(service)
+            service.create_profile(target, name)
             # Save semantics: what a monitor forgets is pushed, so the new
             # profile is also what the screen shows.
-            report = service.reassert_saved(
-                reassert=Reassert.PIVOT, monitor_ids=[monitor_id]
-            )
+            report = service.reassert_saved(reassert=Reassert.PIVOT, monitor_ids=[target])
             return report, service.profiles_by_monitor()
 
         def done(result: object, error: BaseException | None) -> None:
             self._set_busy(False)
             if error is not None:
                 self.status(f"Could not create the profile: {error}", error=True)
-                self._refresh_after_failure(monitor_id)
+                self._refresh_after_failure(ident)
                 return
             report, self.profiles = result
             self._refresh_state()
@@ -1945,8 +2285,9 @@ class MainWindow:
             or not self._free_after_dialog(monitor_id)
         ):
             return
+        locate = self.locator(monitor_id)
         self._profile_change(
-            lambda s: s.rename_profile(monitor_id, current.name, name),
+            lambda s: s.rename_profile(locate(s), current.name, name),
             monitor_id,
             done_message=f"Renamed “{current.name}” to “{name}”.",
             label="Renaming profile",
@@ -1964,8 +2305,9 @@ class MainWindow:
             icon="warning",
         ) or not self._free_after_dialog(monitor_id):
             return
+        locate = self.locator(monitor_id)
         self._profile_change(
-            lambda s: s.delete_profile(monitor_id, name),
+            lambda s: s.delete_profile(locate(s), name),
             monitor_id,
             done_message=f"Deleted “{name}”.",
             label="Deleting profile",
@@ -1980,6 +2322,7 @@ class MainWindow:
         label: str,
     ) -> None:
         """Run a change that touches only the profiles file, then redraw."""
+        ident = self._ident(monitor_id)
         self._set_busy(True, f"{label}…")
 
         def run(service: MonitorService) -> dict[str, MonitorProfiles | None]:
@@ -1990,7 +2333,7 @@ class MainWindow:
             self._set_busy(False)
             if error is not None:
                 self.status(str(error), error=True)
-                self._refresh_after_failure(monitor_id)
+                self._refresh_after_failure(ident)
                 return
             self.profiles = result
             self._refresh_state()
@@ -1998,8 +2341,10 @@ class MainWindow:
 
         self.bridge.worker.submit(run, done, label=label)
 
-    def _refresh_after_failure(self, monitor_id: str) -> None:
-        bar = self.profile_bars.get(monitor_id)
+    def _refresh_after_failure(self, ident: str) -> None:
+        """Show the profile bar of the monitor filed as ``ident`` as it is."""
+        monitor_id = self._monitor_id_of(ident)
+        bar = self.profile_bars.get(monitor_id) if monitor_id else None
         if bar is not None:
             bar.refresh()
 
@@ -2102,6 +2447,8 @@ class MainWindow:
                 popdown = f"{widget}.popdown"
                 if self.root.tk.call("winfo", "exists", popdown):
                     self.root.tk.call("destroy", popdown)
+        for spinner in (self.spinner, self.placeholder_spinner):
+            spinner.recolour()  # the status bar's is not on the page colour
         self._calibrations = [c for c in self._calibrations if c.top.winfo_exists()]
         for calibration in self._calibrations:
             calibration.set_palette(p)
@@ -2129,14 +2476,36 @@ class MainWindow:
             button.state(["disabled"] if busy else ["!disabled"])
         if busy:
             self.status(message, sticky=True)
-        self.root.configure(cursor="watch" if busy else "")
+        self._show_spinners(busy)
         self._refresh_state()
+        if not busy and self._deferred is not None:
+            # A Save or Restore asked for meanwhile (see _when_free); before a
+            # reload also waiting, which queues itself behind it again.
+            action, self._deferred = self._deferred, None
+            self.root.after_idle(action)
         if not busy and self._load_wanted is not None:
             # A reload asked for while busy (see load); after the result of
             # the operation that just ended has been drawn.
             probe = self._load_wanted
             self._load_wanted = None
             self.root.after_idle(lambda: self.load(probe=probe))
+
+    def _show_spinners(self, busy: bool) -> None:
+        """Turn the spinners while busy: beside the status message, and where
+        the monitors will appear if none is shown yet."""
+        if busy:
+            if not self.spinner.turning:
+                self.spinner.canvas.pack(
+                    side="left", padx=(0, 8), before=self.status_label
+                )
+                self.spinner.start()
+            if not self.placeholder_spinner.turning:
+                self.placeholder_spinner.canvas.pack(side="top", pady=(0, 10))
+                self.placeholder_spinner.start()
+        else:
+            for spinner in (self.spinner, self.placeholder_spinner):
+                spinner.stop()
+                spinner.canvas.pack_forget()
 
     def _refresh_state(self) -> None:
         """Redraw everything that depends on saved-vs-current and busy: the
@@ -2150,12 +2519,22 @@ class MainWindow:
         waiting = self.staged_count()
         self.auto_check.state(["disabled"] if self.busy else ["!disabled"])
         self.apply_button.configure(text=f"Apply ({waiting})" if waiting else "Apply")
-        can_apply = waiting and not self.busy
+        # Always there to press: with nothing waiting it pushes what the
+        # window shows (push_current).  Highlighted only when changes wait.
+        can_apply = bool(waiting or self.monitors) and not self.busy
         self.apply_button.state(["!disabled"] if can_apply else ["disabled"])
-        self.apply_button.configure(style="Accent.TButton" if can_apply else "TButton")
-        self.discard_button.state(["!disabled"] if can_apply else ["disabled"])
+        self.apply_button.configure(
+            style="Accent.TButton" if can_apply and waiting else "TButton"
+        )
+        can_discard = waiting and not self.busy
+        self.discard_button.state(["!disabled"] if can_discard else ["disabled"])
         drifted = self.drifted()
-        self.bridge.set_editing(drifted and self.root.state() != "withdrawn")
+        # The keeper also waits while the user's own writes are on their way:
+        # until their result is drained here, the drift they create is not
+        # known yet, and a check run between them would undo it on the
+        # monitor (or under a Save chained after an Apply).
+        working = self.busy or bool(self.writing)
+        self.bridge.set_editing((drifted or working) and self.root.state() != "withdrawn")
         if waiting:
             text, style = "changes not applied", "Drifted.Toolbar.TLabel"
         elif not saved:

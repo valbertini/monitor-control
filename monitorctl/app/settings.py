@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 
-from ..fileio import atomic_write_text, state_directory
+from ..fileio import UNREADABLE, atomic_write_text, decode_state, state_directory
 
 __all__ = [
     "MAX_INTERVAL_MINUTES",
@@ -225,14 +225,14 @@ class SettingsStore:
         if self._path is None:
             return AppSettings()
         try:
-            raw = self._path.read_text(encoding="utf-8")
+            raw = self._path.read_bytes()
         except FileNotFoundError:
             return AppSettings()
         except OSError as exc:
             _log.warning("could not read %s: %s", self._path, exc)
             return AppSettings()
         try:
-            return AppSettings.from_payload(json.loads(raw))
-        except ValueError as exc:  # json.JSONDecodeError is a ValueError
+            return AppSettings.from_payload(json.loads(decode_state(raw)))
+        except UNREADABLE as exc:
             _log.warning("ignoring unreadable settings %s: %s", self._path, exc)
             return AppSettings()

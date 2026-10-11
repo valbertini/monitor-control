@@ -26,6 +26,7 @@ from .ddc.service import MonitorService, MonitorState, Reassert
 from .ddc.snapshot import legacy_snapshot_path
 from .ddc.vcp import CATEGORIES, FEATURES, feature_by_code
 from .fileio import state_directory
+from .gpu.gamma import SOFTWARE_LUT_KEYS
 
 __all__ = ["main"]
 
@@ -244,6 +245,12 @@ def _cmd_get(service: MonitorService, args: argparse.Namespace) -> int:
 
 
 def _cmd_set(service: MonitorService, args: argparse.Namespace) -> int:
+    if args.feature in SOFTWARE_LUT_KEYS:
+        # It would be undone as this process exits (``GammaRampBackend.close``).
+        raise SystemExit(
+            f"{args.feature} lasts only while the process that set it runs; "
+            "set it in the tray app's window."
+        )
     monitor = _resolve(service, args.monitor)
     outcome = service.write_feature(monitor.id, args.feature, args.value)
     confirmed = outcome.confirmed if outcome.confirmed is not None else outcome.applied
@@ -257,7 +264,9 @@ def _cmd_set(service: MonitorService, args: argparse.Namespace) -> int:
 
 def _cmd_save(service: MonitorService, args: argparse.Namespace) -> int:
     del args
-    snapshot = service.save_snapshot()
+    # This process cannot see the software LUT values the tray app applies;
+    # it would read them as neutral and erase them from every profile.
+    snapshot = service.save_snapshot(keep_saved=SOFTWARE_LUT_KEYS)
     print(
         f"Saved {snapshot.value_count} settings "
         f"across {len(snapshot.monitors)} monitor(s), "
@@ -326,6 +335,10 @@ def _cmd_autostart(args: argparse.Namespace) -> int:
     current = key.get(autostart.VALUE_NAME)
     if current is None:
         print("Start with Windows: off")
+    elif key.switched_off(autostart.VALUE_NAME):
+        print("Start with Windows: off (switched off in Task Manager > Startup apps)")
+        print(f"    {current}")
+        print("    'autostart enable' switches it back on.")
     else:
         here = current == autostart.launch_command()
         print(f"Start with Windows: on{'' if here else ' (another copy of monitorctl)'}")

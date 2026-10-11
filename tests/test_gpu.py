@@ -234,6 +234,19 @@ class TestGammaRampOwnership(unittest.TestCase):
         self.backend.set(self.DEVICE, self.key, 50)
         self.assertEqual(self.device_ramp(), list(reset[2]))
 
+    def test_a_ramp_replaced_behind_our_back_no_longer_reads_as_applied(self) -> None:
+        """Otherwise Restore compares against the remembered value, finds it
+        "already correct" and leaves the screen without the adjustment."""
+        self.backend.set(self.DEVICE, self.key, 70)
+        self.assertEqual(self.backend.get(self.DEVICE, self.key).current, 70)
+        ctypes.memmove(
+            self.gdi.ramps[self.DEVICE], self.foreign, ctypes.sizeof(self.foreign)
+        )
+        self.assertEqual(self.backend.get(self.DEVICE, self.key).current, 50)
+        self.gdi.writes = 0
+        self.backend.close()  # theirs now: nothing to give back
+        self.assertEqual(self.gdi.writes, 0)
+
     def test_a_ramp_no_longer_ours_is_left_alone_on_the_way_back(self) -> None:
         self.backend.set(self.DEVICE, self.key, 70)
         ctypes.memmove(

@@ -36,6 +36,11 @@ decision there in the same context → decision → alternatives → consequence
 - Windows renumbers `\\.\DISPLAYn` between boots (TCL has been DISPLAY1, 2, 1).
   Identity is the EDID `hardware_id`; device/id are positions.
 - The ASUS keeps its settings: automatic code must never write to it.
+- The ASUS runs on HDMI (reported as `input_source` 4, "DVI 2"); its VGA geometry
+  controls read noise there (181, later 189, max 100). D32: inert on a digital
+  input - never saved, restored or compared.
+- Task Manager's *Startup apps* switch (`StartupApproved\Run`, first byte odd =
+  off) overrides the Run value; it was switched off on 2026-10-03 (D32).
 
 ## Design invariants (break one only with the user's agreement)
 
@@ -64,6 +69,9 @@ decision there in the same context → decision → alternatives → consequence
 - Only the bus thread (`app/worker.py`) touches the service; results reach the UI
   via `PostMessageW` → `Worker.drain()` on the main thread. Tk runs only on the main
   thread and is imported only when the window first opens.
+- The hidden window's handlers (ctypes WNDPROC) **never call Tk** once Tk owns the
+  loop: route through `TkHandoff.run` (`app/handoff.py`). A Tk call there aborts the
+  interpreter a moment later (D30); `tests/test_handoff.py` reproduces it.
 - Policy blocks (`ddc/policy.py`): `0xE0–0xFF`, factory resets, `0xB0`, `0xCA`, `0xD6`.
 
 ## Commands
@@ -83,7 +91,11 @@ real, transparent Tk window with an inline worker.
 
 ## Gotchas
 
-- **Not a git repo.** Before large changes, tar a backup into the scratchpad.
+- Git repo since 2026-10-02 (`main`); commit only when the user asks.
+- In Git Bash `python` may resolve to `.venv-build` (no ruff); use the system
+  interpreter (`py` / `%LOCALAPPDATA%\Python\bin\python`) for tests and ruff.
+- A native abort leaves nothing in `monitorctl.log`: read `crash.log` beside it,
+  the Application event log (`0xc0000409` = abort) and `%LOCALAPPDATA%\CrashDumps`.
 - Editing through a bash heredoc mangles backslashes (`\\.\DISPLAY1`, `\n`, `\d`).
   Use the Edit/Write tools for any text containing a backslash. Python
   `write_text` on Windows writes CRLF; the repo already mixes LF and CRLF per file.
@@ -95,15 +107,18 @@ real, transparent Tk window with an inline worker.
 - Memory numbers: measure the packaged exe with private working set
   (`Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate`), not private bytes.
 
-## Open items (as of 2026-10-02, v0.2.0)
+## Open items (as of 2026-10-03, v0.2.0)
 
 - Validate TCL power-cycle **detection** with the user (power button with app in
   tray, then read `%LOCALAPPDATA%\monitorctl\monitorctl.log` for
   `Windows reported`, `stopped answering`, `came back on`). Fallback: `rewrite` mode.
-- Start-with-Windows not enabled yet; the legacy scheduled task
-  `monitorctl-restore` (v0.1) is still installed and is removed when it is enabled.
+- Start-with-Windows: the Run key points at `dist\monitorctl` (which a rebuild
+  deletes) and Task Manager's switch is off; re-enabling from a rebuilt app
+  clears it (D32). Needs an install location outside `dist/` (ask). Seven more findings of the 2026-10-03 review wait for a decision:
+  `docs/PROJETO.md` §11.
 - The saved snapshot dates from 2026-09-30 and differs from current values; the
   user decides whether to re-save. On first run of the profiles build it becomes
   each monitor's "Default" profile (`snapshot.json` is kept, no longer read).
-- The running tray exe (`dist\monitorctl`) predates the 2026-10-02 review fixes,
-  the UI input changes and profiles; rebuilding stops it (`--quit`) - ask first.
+- The running tray exe (`dist\monitorctl`) predates the crash fix (D30), the
+  calibration rewrite (D31) and the focus-ring fix; rebuilding stops it
+  (`--quit`) - ask first.

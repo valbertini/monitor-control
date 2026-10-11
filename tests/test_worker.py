@@ -27,7 +27,12 @@ class FakeKeeper:
         self.ticks = 0
         self.ticked = threading.Event()
         self.handled = threading.Event()
+        self.caught_up = threading.Event()
         self.fail = False
+
+    def catch_up(self):
+        self.caught_up.set()
+        return None
 
     def tick(self):
         self.ticks += 1
@@ -151,6 +156,19 @@ class TestChecks(WorkerTestCase):
             self.assertTrue(self.keeper.ticked.wait(TIMEOUT))
             self.keeper.ticked.clear()
             self.assertTrue(self.keeper.ticked.wait(TIMEOUT))
+
+    def test_a_nudge_lets_the_keeper_catch_up_now_not_at_the_next_check(self) -> None:
+        worker = self.make(interval=3600.0)
+        self.assertFalse(self.keeper.caught_up.wait(0.1))
+        worker.nudge()
+        self.assertTrue(self.keeper.caught_up.wait(TIMEOUT))
+        self.assertEqual(self.keeper.ticks, 0)
+
+    def test_changed_settings_nudge_too(self) -> None:
+        """Unpausing is a settings change."""
+        worker = self.make(interval=3600.0)
+        worker.reschedule()
+        self.assertTrue(self.keeper.caught_up.wait(TIMEOUT))
 
 
 class TestStop(WorkerTestCase):

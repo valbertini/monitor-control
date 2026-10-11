@@ -64,7 +64,7 @@ from .snapshot import (
     Snapshot,
     pair_monitors,
 )
-from .vcp import FEATURES, FeatureKind, VcpFeature
+from .vcp import FEATURES, GEOMETRY_KEYS, FeatureKind, VcpFeature, inert_keys
 
 __all__ = [
     "PIVOT_VALUE",
@@ -211,6 +211,13 @@ class MonitorState:
         return tuple(f for f in self.features if f.supported)
 
     @property
+    def inert(self) -> frozenset[str]:
+        """Controls that do nothing on the input last read: never saved,
+        restored or compared (``vcp.inert_keys``)."""
+        source = self.feature("input_source")
+        return inert_keys(source.value if source is not None else None)
+
+    @property
     def probed(self) -> bool:
         """Whether the DDC/CI values were read, as opposed to only enumerated.
 
@@ -299,9 +306,11 @@ def _unique_by_hardware_id(states: Iterable[MonitorState]) -> dict[str, MonitorS
 def _restorable_values(state: MonitorState) -> dict[str, int]:
     """The values of one monitor that are worth capturing in a snapshot.
 
-    Anything the monitor does not implement has no value to save, and a
-    momentary command has no state to put back.
+    Anything the monitor does not implement has no value to save, a momentary
+    command has no state to put back, and a control inert on the current input
+    reads noise.
     """
+    inert = state.inert
     return {
         feature.key: feature.value
         for feature in state.features
@@ -309,6 +318,7 @@ def _restorable_values(state: MonitorState) -> dict[str, int]:
         and feature.writable
         and feature.value is not None
         and feature.key not in NON_RESTORABLE_KEYS
+        and feature.key not in inert
     }
 
 
@@ -740,6 +750,35 @@ class MonitorService:
                 raise MonitorNotFound(f"unknown monitor: {monitor_id!r}")
             return state
 
+    def resolve(self, hardware_id: str, monitor_id: str) -> str:
+        """The id the monitor known as ``hardware_id`` has *now*.
+
+        Ids are positions (``\\\\.\\DISPLAYn``), and Windows renumbers them
+        when it re-enumerates.  A caller that picked a monitor before a
+        re-enumeration - a job waiting in the bus queue behind a keeper rescan -
+        would otherwise act on whichever monitor took that position.  The EDID
+        identity is what stays with the panel.  The position is used only when
+        there is no identity to go by: none was read, or two connected
+        monitors share it (identical panels without a serial).
+
+        Args:
+            hardware_id: The EDID identity seen when the monitor was picked;
+                empty if it had none.
+            monitor_id: Its id at that time.
+
+        Raises:
+            MonitorNotFound: That monitor is no longer connected.
+        """
+        with self._lock:
+            present = self.list_monitors(probe=False)
+            unique = _unique_by_hardware_id(present)
+            if hardware_id in unique:
+                return unique[hardware_id].id
+            shared = any(s.hardware_id == hardware_id for s in present)
+            if (not hardware_id or shared) and any(s.id == monitor_id for s in present):
+                return monitor_id
+            raise MonitorNotFound("that monitor is no longer connected")
+
     def read_feature(self, monitor_id: str, key: str) -> FeatureState:
         """Re-read one feature from the hardware and update the cache.
 
@@ -1035,7 +1074,11 @@ class MonitorService:
             return found
 
     def save_snapshot(
-        self, *, reread: bool = False, monitor_ids: Iterable[str] | None = None
+        self,
+        *,
+        reread: bool = False,
+        monitor_ids: Iterable[str] | None = None,
+        keep_saved: Iterable[str] = (),
     ) -> Snapshot:
         """Store the current value of every restorable control in each
         monitor's active profile, creating "Default" for a monitor without one.
@@ -1048,10 +1091,14 @@ class MonitorService:
                 monitor's own buttons is invisible to the cache.
             monitor_ids: Only these monitors; ``None`` means all connected.
                 The profiles of the others, connected or not, are untouched.
+            keep_saved: Keys this process cannot see the true value of: each
+                profile keeps what it holds for them.  The CLI passes the
+                software LUT controls, whose values live in the tray app.
 
         Raises:
             SnapshotError: If the profiles could not be persisted.
         """
+        keep_saved = frozenset(keep_saved)
         with self._lock:
             present = self._probed_monitors()
             wanted = None if monitor_ids is None else frozenset(monitor_ids)
@@ -1065,7 +1112,11 @@ class MonitorService:
                         id=state.id,
                         name=state.name,
                         device=state.device,
-                        values=_restorable_values(state),
+                        values={
+                            key: value
+                            for key, value in _restorable_values(state).items()
+                            if key not in keep_saved
+                        },
                         hardware_id=state.hardware_id,
                     )
                     for state in states
@@ -1074,7 +1125,8 @@ class MonitorService:
             # Controls whose read failed have no value here; their saved one
             # stays in the profile rather than being dropped on that evidence.
             unread = {
-                state.id: frozenset(f.key for f in state.features if f.read_failed)
+                state.id: keep_saved
+                | frozenset(f.key for f in state.features if f.read_failed)
                 for state in states
             }
             self._profiles.save(snapshot, present, keep=unread)
@@ -1258,6 +1310,71 @@ class MonitorService:
         wanted = None if monitor_ids is None else frozenset(monitor_ids)
         return self._put_back(reassert=reassert, monitor_ids=wanted, upkeep=True)
 
+    def reassert_current(
+        self, *, reassert: Reassert, monitor_ids: Iterable[str] | None = None
+    ) -> RestoreReport:
+        """Push the *current* values of the controls a monitor cannot be trusted with.
+
+        The same controls as :meth:`reassert_saved` - volatile ones, through
+        ``reassert``, and GPU adjustments away from neutral - but with the
+        values this service holds for them rather than the saved ones: for
+        the window's Apply with nothing waiting, which makes the screen show
+        what the window shows, saved or not.  Needs no profile.
+
+        Args:
+            reassert: Strategy for the volatile controls.
+            monitor_ids: Only these monitors; ``None`` means every connected one.
+        """
+        wanted = None if monitor_ids is None else frozenset(monitor_ids)
+        with self._lock:
+            applied: list[WriteOutcome] = []
+            failed: list[RestoreIssue] = []
+            targets = [
+                (state, feature)
+                for state in self.list_monitors(probe=False)
+                if wanted is None or state.id in wanted
+                for feature in state.features
+                if (feature.key in state.volatile or feature.code is None)
+                and feature.supported
+                and feature.writable
+                and feature.value is not None
+                # Neutral is not monitorctl's to push (D25, D27).
+                and not (feature.code is None and feature.value == feature.neutral)
+            ]
+            for state, feature in targets:
+                volatile = feature.key in state.volatile
+                try:
+                    applied.append(
+                        self.write_feature(
+                            state.id,
+                            feature.key,
+                            feature.value,
+                            reassert=reassert if volatile else None,
+                        )
+                    )
+                except RateLimited as exc:
+                    # Every later write would fail the same way.
+                    failed.append(
+                        RestoreIssue(state.id, state.name, feature.key, str(exc))
+                    )
+                    break
+                except DdcError as exc:  # GpuError is one too
+                    failed.append(
+                        RestoreIssue(state.id, state.name, feature.key, str(exc))
+                    )
+            _log.info(
+                "pushed the current values again: %d written, %d failed",
+                len(applied),
+                len(failed),
+            )
+            return RestoreReport(
+                saved_at=0.0,
+                applied=tuple(applied),
+                unchanged=0,
+                skipped=(),
+                failed=tuple(failed),
+            )
+
     def _put_back(
         self,
         *,
@@ -1299,6 +1416,17 @@ class MonitorService:
                     continue
 
                 pending = dict(saved.values)
+                if not upkeep:
+                    inert = self._inert_now(state, pending.keys())
+                    if inert:
+                        # Not a problem to report: there is nothing to put back.
+                        _log.info(
+                            "%s: on a digital input, left alone: %s",
+                            state.name,
+                            ", ".join(sorted(inert)),
+                        )
+                        for key in inert:
+                            del pending[key]
                 # Registry order, so a coarse control lands before the fine ones
                 # it resets: writing a colour preset after its own gains would
                 # silently undo them.
@@ -1315,11 +1443,16 @@ class MonitorService:
                         # re-applying it on every event would overwrite what
                         # the NVIDIA panel, Night Light or a game set (D25).
                         continue
-                    if feature.supported and not volatile and not upkeep:
+                    if feature.read_failed or (
+                        feature.supported and not volatile and not upkeep
+                    ):
                         # The cache can be days old in the tray app, and the
                         # monitor's own buttons change values behind it.  A
                         # read costs no EEPROM wear; a missed restore costs
-                        # the user's calibration.
+                        # the user's calibration.  A control whose read failed
+                        # (a probe during power-up) is tried again whatever
+                        # the mode: carried over by every enumeration, it
+                        # would otherwise be skipped until a manual rescan.
                         try:
                             feature = self.read_feature(state.id, feature.key)
                         except DdcUnsupportedFeature as exc:
@@ -1393,6 +1526,25 @@ class MonitorService:
                 skipped=tuple(skipped),
                 failed=tuple(failed),
             )
+
+    def _inert_now(self, state: MonitorState, keys: Iterable[str]) -> frozenset[str]:
+        """Which of ``keys`` do nothing on the input ``state`` shows right now.
+
+        The input is read again first, and only when the answer matters: the
+        cache can be days old in the tray app, and the input is changed with
+        the monitor's own buttons.  A failed read leaves the cached input to
+        decide; with none, nothing counts as inert (``vcp.inert_keys``).
+        """
+        keys = frozenset(keys)
+        if not keys & GEOMETRY_KEYS:
+            return frozenset()
+        source = state.feature("input_source")
+        if source is not None and source.supported:
+            try:
+                source = self.read_feature(state.id, "input_source")
+            except DdcError as exc:
+                _log.info("%s :: input_source kept its cached value: %s", state.name, exc)
+        return inert_keys(source.value if source is not None else None) & keys
 
     def _probed_monitors(self) -> tuple[MonitorState, ...]:
         """The monitors, with every value read.

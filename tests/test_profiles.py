@@ -274,6 +274,24 @@ class TestStore(unittest.TestCase):
         self.assertEqual(aside.read_text(encoding="utf-8"), "{not json")
         self.assertEqual(ProfileStore(self.path).load(), one_monitor_snapshot(50))
 
+    def test_damaged_bytes_and_absurd_numbers_read_as_nothing(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        ProfileStore(self.path).save(one_monitor_snapshot(50))
+        huge = self.path.read_text(encoding="utf-8").replace(
+            '"savedAt": 1.0', '"savedAt": 1' + "0" * 400
+        )
+        self.assertNotEqual(huge, self.path.read_text(encoding="utf-8"))
+        for raw in (b"\xff\xfe{", b"[" * 100_000, huge.encode()):
+            with self.subTest(raw=raw[:8]):
+                self.path.write_bytes(raw)
+                with self.assertLogs("monitorctl.ddc.profiles", level="WARNING"):
+                    self.assertIsNone(ProfileStore(self.path).load())
+
+    def test_a_byte_order_mark_is_accepted(self) -> None:
+        ProfileStore(self.path).save(one_monitor_snapshot(50))
+        self.path.write_bytes(b"\xef\xbb\xbf" + self.path.read_bytes())
+        self.assertEqual(ProfileStore(self.path).load(), one_monitor_snapshot(50))
+
     def test_a_file_of_a_newer_version_reads_as_nothing(self) -> None:
         self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps({"version": 99, "monitors": []}), "utf-8")
@@ -299,7 +317,7 @@ class TestStore(unittest.TestCase):
     def test_an_unchanged_file_is_not_read_again(self) -> None:
         store = ProfileStore(self.path)
         store.save(one_monitor_snapshot(50))
-        with mock.patch.object(Path, "read_text") as read:
+        with mock.patch.object(Path, "read_bytes") as read:
             store.load()
         read.assert_not_called()
 
@@ -511,7 +529,9 @@ class TestReadFailures(unittest.TestCase):
         self.before = self.path.read_bytes()
 
     def locked(self):
-        return mock.patch.object(Path, "read_text", side_effect=PermissionError("locked"))
+        return mock.patch.object(
+            Path, "read_bytes", side_effect=PermissionError("locked")
+        )
 
     def test_the_last_good_book_is_still_served(self) -> None:
         with self.locked(), self.assertLogs("monitorctl.ddc.profiles", "WARNING"):

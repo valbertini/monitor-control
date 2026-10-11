@@ -53,7 +53,8 @@ onde quiser (ex.: `%LOCALAPPDATA%\Programs\monitorctl`) e rode
   *Start with Windows*, *Exit*. Passe o mouse para ver o estado e a última ação.
 - **Iniciar com o Windows**: marque em *Settings* (ou no menu da bandeja). Fica
   na chave `Run` do usuário — aparece em *Gerenciador de Tarefas → Aplicativos
-  de inicialização*, onde também dá para desligar. Se a pasta for movida, o app
+  de inicialização*, onde também dá para desligar; desligado lá, a caixa do app
+  aparece desmarcada, e marcá-la religa os dois. Se a pasta for movida, o app
   corrige o caminho sozinho na próxima vez que abrir. Abrir *outra* cópia que
   ainda existe (o build em `dist/`, o código-fonte) não mexe no registro; para
   trocar de cópia, desmarque e marque de novo nela.
@@ -75,6 +76,10 @@ onde quiser (ex.: `%LOCALAPPDATA%\Programs\monitorctl`) e rode
   ele desligado só mostra os valores do perfil, sem aplicar; Save e New aplicam
   antes de salvar; fechar a janela pergunta o que fazer com as pendências. Uma
   pendência tem um • no nome, e o ↺ ao lado dela a cancela.
+- **Apply sem pendências** (sempre dá para clicar): reenvia o que a janela
+  mostra para os controles que um monitor esquece (os voláteis do TCL, via 50,
+  e os ajustes de GPU). Serve para quando o monitor foi desligado e a tela não
+  bate com a janela. O que o monitor guarda não é reescrito.
 - **Controles de uma cor ficam naquela cor**: ponto e slider vermelhos no ganho
   vermelho, e assim por diante (seis eixos na ordem do círculo cromático). O nome
   continua escrito — a cor nunca é a única pista.
@@ -84,7 +89,12 @@ onde quiser (ex.: `%LOCALAPPDATA%\Programs\monitorctl`) e rode
   valor salvo só daquele controle.
 - **Slider + campo numérico** em cada controle contínuo; lista para os de
   escolha. Campo inválido fica vermelho e volta ao último valor confirmado.
-  Arrastar o slider só escreve quando o valor para por 250 ms.
+  Arrastar o slider só escreve quando o valor para por 250 ms. Save, Apply e
+  fechar não esperam esses 250 ms: enviam o último valor na hora e só agem
+  depois que o monitor confirmar.
+- Enquanto a janela lê ou escreve, um **indicador gira** ao lado da mensagem na
+  barra de status (o cursor não muda). Save/Restore pedidos nesse meio-tempo,
+  pela bandeja ou por `Ctrl+S`, rodam quando a operação termina.
 - **Legenda ao passar o mouse** no nome do controle (explicação + código VCP);
   pelo teclado, a mesma legenda aparece na barra de status.
 - **Perfis por monitor**, **Save / Restore**: ver
@@ -95,14 +105,16 @@ onde quiser (ex.: `%LOCALAPPDATA%\Programs\monitorctl`) e rode
   rola a página**: nenhum controle muda de valor por ela.
 - **Fechar com alterações não salvas** pergunta: salvar, voltar ao salvo, ou
   cancelar.
-- **Calibration**: um guia de 8 passos para calibrar **a olho**, cada um com o
-  padrão, o que olhar e qual controle mexer — preparação → brilho → altas-luzes
-  (barras 235–254 **piscando** sobre branco: ajuste o Contrast até todas
-  piscarem) → sombras (barras 1–25 piscando sobre preto) → equilíbrio de cinza
-  (ganho e offset) → gama (linhas de 1 px; 186 = 2.2) → gradientes → cores
-  (compare com uma foto ou app que você conhece bem). Arraste a janela até o
-  monitor em ajuste e use **F11** para tela cheia; ← → trocam de passo. Pesquisa
-  em [`docs/PESQUISA-CALIBRACAO.md`](docs/PESQUISA-CALIBRACAO.md).
+- **Calibration**: um guia de 8 passos para calibrar **a olho**. Cada passo tem
+  **um objetivo concreto** e linhas "se X → mexa Y, para cima/baixo":
+  preparação → brilho → altas-luzes (barra **254 pisca no limite**; senão baixe
+  o Contrast) → sombras (barra **3 pisca no limite**, 1–2 podem sumir) →
+  equilíbrio de cinza (matiz → canal a baixar) → gama (um quadrado 186 dentro de
+  listras de 1 px: **some = gama 2.2**; mais escuro → suba Gamma (software)) →
+  gradientes → cores (compare com uma foto que você conhece bem). Arraste a
+  janela até o monitor em ajuste e use **F11** para tela cheia (o objetivo fica
+  no rodapé); ← → trocam de passo. Pesquisa em
+  [`docs/PESQUISA-CALIBRACAO.md`](docs/PESQUISA-CALIBRACAO.md).
 - **Settings**: intervalo e modo da reaplicação automática, pausa, aplicar ao
   iniciar, iniciar com o Windows, pasta de dados.
 - Tema **escuro por padrão** (barra de título inclusa), ☀/☾ alterna. A janela
@@ -179,7 +191,11 @@ loop de desgaste de EEPROM.
 
 O intervalo é configurável (1 min a 24 h). Enquanto a janela tem **alterações não
 salvas**, a reaplicação automática fica suspensa — senão o timer desfaria cada
-slider que você move. *Pause automatic re-apply* suspende tudo.
+slider que você move. *Pause automatic re-apply* suspende tudo. Suspenso não é
+cego: um aviso do Windows nesse meio-tempo, um monitor que voltou (o modo
+*detect* continua lendo enquanto a janela segura a reaplicação) ou a própria
+pausa deixam uma reaplicação **devida**, feita via 50 assim que a janela é
+fechada, as alterações são salvas/restauradas ou a pausa é desligada.
 
 > **A validar:** a detecção do religamento do TCL ainda não foi testada desligando
 > o monitor no botão com o app aberto. O log
@@ -209,7 +225,7 @@ allowlist é fechada: só o que está no registro pode ser escrito.
 | Six-Axis Hue | R `0x9B`, Y `0x9C`, G `0x9D`, C `0x9E`, B `0x9F`, M `0xA0` |
 | Input | input source `0x60` |
 | Audio | volume `0x62`, mute `0x8D`, treble `0x8F`, bass `0x91`, balance `0x93` |
-| Geometry (analógico) | auto setup `0x1E`, H/V position `0x20`/`0x30`, H/V size `0x22`/`0x32`, clock `0x0E`, phase `0x3E` |
+| Geometry (analógico) | auto setup `0x1E`, H/V position `0x20`/`0x30`, H/V size `0x22`/`0x32`, clock `0x0E`, phase `0x3E` — em entrada digital ficam fora do Save, do Restore e de "unsaved changes" (D32) |
 | On-Screen Display | language `0xCC`, orientation `0xAA` |
 | **GPU Colour (driver)** | saturation (vibrance), hue angle |
 | **GPU Tone Curve (software)** | brightness, contrast, gamma |
